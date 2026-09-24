@@ -58,9 +58,9 @@ pub struct Core {
     pub(crate) reader_capacity: usize,
     pub(crate) write_cursor: WriteCursor,
     #[cfg(feature = "telemetry")]
-    pub(crate) writer_metrics: TelemetryShard,
+    pub writer_metrics: Arc<TelemetryShard>,
     #[cfg(feature = "telemetry")]
-    pub(crate) reader_metrics: Vec<TelemetryShard>,
+    pub reader_metrics: Arc<Vec<TelemetryShard>>,
 }
 
 unsafe impl Sync for Core {}
@@ -101,9 +101,9 @@ impl Core {
                 offset: AtomicUsize::new(0),
             },
             #[cfg(feature = "telemetry")]
-            writer_metrics: TelemetryShard::default(),
+            writer_metrics: Arc::new(TelemetryShard::default()),
             #[cfg(feature = "telemetry")]
-            reader_metrics,
+            reader_metrics: Arc::new(reader_metrics),
         }
     }
 

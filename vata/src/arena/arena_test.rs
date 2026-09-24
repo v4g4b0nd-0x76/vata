@@ -140,7 +140,7 @@ fn test_concurrent_multi_reader_spinning_no_cache_race() {
 
     // 3. Confirm that thread telemetry shards maintained structural isolation
     #[cfg(feature = "telemetry")]
-    for shard in &core.reader_metrics {
+    for shard in core.reader_metrics.iter() {
         let ops = shard.ops_count.load(Ordering::Relaxed);
         assert!(
             ops > 0,

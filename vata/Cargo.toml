@@ -7,7 +7,19 @@ edition = "2024"
 telemetry = []
 
 [dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
 tikv-jemallocator = "0.6"
+tokio = { version = "1.52.3", default-features = false, features = [
+    "rt",
+    "process",
+    "fs",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+] }
+toml = "1.1.6"
 [[bench]]
 name = "arena_bench"
 harness = false
