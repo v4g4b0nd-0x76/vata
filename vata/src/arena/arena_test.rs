@@ -231,3 +231,52 @@ fn test_out_of_order_non_sequential_slab_reclamation() {
         "Dynamic control registration registry suffered an unexpected flag drop!"
     );
 }
+
+/// Regression test for the free-stack reclamation optimization: with zero registered
+/// readers, every slab the writer rolls off of must be immediately self-reclaimed
+/// (reader_mask stays 0 forever, since no reader exists to ever clear a bit to zero),
+/// so the ring can cycle far beyond its raw slab count without stalling. Before the
+/// self-reclaim branch in `handle_write_rollover`, a stack-based free list would have
+/// exhausted its initial population after one lap and livelocked here.
+#[test]
+fn test_free_stack_reclaims_across_many_ring_laps_with_no_readers() {
+    let core = Arc::new(Core::new(4, 0));
+    let payload = vec![b'C'; SLAB_SIZE - CACHE_LINE - 8];
+
+    // Force well more than `pool_cap` rollovers.
+    for _ in 0..20 {
+        unsafe { core.append_bytes(&payload) };
+    }
+
+    let final_idx = core.write_cursor.slab_idx.load(Ordering::Acquire);
+    assert!(final_idx < 4, "writer index must stay within the slab pool");
+}
+
+/// A slab must not be handed back to the writer's free stack while a registered reader
+/// is still behind and hasn't caught up to (and left) it yet — the writer's self-reclaim
+/// branch must only fire when reader_mask is genuinely empty, not just "no reader has
+/// ever been assigned."
+#[test]
+fn test_free_stack_waits_for_a_lagging_reader_before_reuse() {
+    let core = Arc::new(Core::new(3, 1));
+    let _reader = unsafe { ReaderHandle::new(Arc::clone(&core), 0) };
+
+    // First rollover: slab 0 -> slab 1. The reader is still pinned to slab 0 (it has
+    // never actually read anything).
+    unsafe { core.append_bytes(&vec![b'D'; SLAB_SIZE - CACHE_LINE]) };
+    assert_eq!(
+        core.states[0].reader_mask.load(Ordering::Acquire) & 1,
+        1,
+        "slab 0 must stay pinned until the reader actually reads through it"
+    );
+
+    // Second rollover: slab 1 -> slab 2. Slab 0 is STILL pinned (the reader never
+    // moved), so it must not have been handed back onto the free stack — the writer
+    // must still land on slab 2, a genuinely free slab, not reuse the pinned one.
+    unsafe { core.append_bytes(&vec![b'D'; SLAB_SIZE - CACHE_LINE]) };
+    let final_idx = core.write_cursor.slab_idx.load(Ordering::Acquire);
+    assert_eq!(
+        final_idx, 2,
+        "writer must advance to the next free slab, not reuse the still-pinned one"
+    );
+}

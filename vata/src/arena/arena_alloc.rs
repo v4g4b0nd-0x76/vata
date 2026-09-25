@@ -30,10 +30,12 @@ pub struct TelemetryShard {
     pub total_duration: AtomicU64,
 }
 
+/// Per-slab control state.
 #[repr(C, align(64))]
 pub struct SlabState {
     pub reader_mask: AtomicU64,
     next_slab_idx: AtomicUsize,
+    next_free: AtomicUsize,
 }
 
 impl Default for SlabState {
@@ -41,6 +43,7 @@ impl Default for SlabState {
         Self {
             reader_mask: AtomicU64::new(0),
             next_slab_idx: AtomicUsize::new(NO_SUCCESSOR),
+            next_free: AtomicUsize::new(NO_SUCCESSOR),
         }
     }
 }
@@ -57,6 +60,8 @@ pub struct Core {
     pub(crate) pool_cap: usize,
     pub(crate) reader_capacity: usize,
     pub(crate) write_cursor: WriteCursor,
+    /// Head of the intrusive free-slab stack. `NO_SUCCESSOR` means empty.
+    free_head: AtomicUsize,
     #[cfg(feature = "telemetry")]
     pub writer_metrics: Arc<TelemetryShard>,
     #[cfg(feature = "telemetry")]
@@ -73,6 +78,51 @@ pub struct ReaderHandle {
     current_offset: Cell<usize>,
 }
 
+/// Streams `len` bytes from `src` to `dst`, using non-temporal (write-combining) stores
+/// when the `non_temporal_writes` Cargo feature is enabled on x86_64, and a plain
+/// `copy_nonoverlapping` everywhere else (this feature does not exist yet — add
+/// `non_temporal_writes = []` under `[features]` in Cargo.toml to opt in).
+#[inline(always)]
+unsafe fn copy_streaming(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(all(feature = "non_temporal_writes", target_arch = "x86_64"))]
+    unsafe {
+        use core::arch::x86_64::{__m128i, _mm_stream_si128};
+
+        let mut i = 0usize;
+        // Streaming stores require a 16-byte aligned destination. Only take the fast
+        // path when that holds; the remainder (and any unaligned case) falls through to
+        // the plain copy below.
+        if (dst as usize) % 16 == 0 {
+            while i + 16 <= len {
+                let chunk = ptr::read_unaligned(src.add(i) as *const __m128i);
+                _mm_stream_si128(dst.add(i) as *mut __m128i, chunk);
+                i += 16;
+            }
+        }
+        if i < len {
+            ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
+        }
+        return;
+    }
+
+    #[cfg(not(all(feature = "non_temporal_writes", target_arch = "x86_64")))]
+    unsafe {
+        ptr::copy_nonoverlapping(src, dst, len);
+    }
+}
+
+/// Issues a store fence when non-temporal writes are active, guaranteeing any streamed
+/// data is globally visible before the cursor position that "publishes" it to readers is
+/// stored. A no-op on the default (non-streaming) path, where ordinary stores are already
+/// ordered correctly by the existing `Ordering::Release` on the cursor stores.
+#[inline(always)]
+fn sfence() {
+    #[cfg(all(feature = "non_temporal_writes", target_arch = "x86_64"))]
+    unsafe {
+        core::arch::x86_64::_mm_sfence();
+    }
+}
+
 impl Core {
     pub fn new(cap: usize, max_readers: usize) -> Self {
         assert!(cap >= 2, "arena requires at least two slabs");
@@ -85,6 +135,15 @@ impl Core {
         for _ in 0..cap {
             states.push(SlabState::default());
         }
+
+        if cap > 1 {
+            for i in 1..cap {
+                let next = if i + 1 < cap { i + 1 } else { NO_SUCCESSOR };
+                states[i].next_free.store(next, Ordering::Relaxed);
+            }
+        }
+        let free_head = AtomicUsize::new(if cap > 1 { 1 } else { NO_SUCCESSOR });
+
         #[cfg(feature = "telemetry")]
         let mut reader_metrics = Vec::with_capacity(max_readers);
         #[cfg(feature = "telemetry")]
@@ -100,10 +159,45 @@ impl Core {
                 slab_idx: AtomicUsize::new(0),
                 offset: AtomicUsize::new(0),
             },
+            free_head,
             #[cfg(feature = "telemetry")]
             writer_metrics: Arc::new(TelemetryShard::default()),
             #[cfg(feature = "telemetry")]
             reader_metrics: Arc::new(reader_metrics),
+        }
+    }
+
+    fn push_free(&self, idx: usize) {
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            self.states[idx].next_free.store(head, Ordering::Relaxed);
+            if self
+                .free_head
+                .compare_exchange_weak(head, idx, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Pops a slab index off the free stack, or `None` if it's currently empty. Only the
+    /// writer calls this (single consumer), but it still needs a CAS because pushers
+    /// (readers, or the writer's own self-reclaim) can race with it concurrently.
+    fn pop_free(&self) -> Option<usize> {
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            if head == NO_SUCCESSOR {
+                return None;
+            }
+            let next = self.states[head].next_free.load(Ordering::Acquire);
+            if self
+                .free_head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(head);
+            }
         }
     }
 
@@ -121,7 +215,13 @@ impl Core {
         #[cfg(not(test))]
         let _ = (offset, current_slab);
 
-        let next_idx = self.route_next_free_index(current_idx);
+        let next_idx = loop {
+            if let Some(idx) = self.pop_free() {
+                break idx;
+            }
+            std::thread::yield_now();
+        };
+
         let reader_mask = self.states[current_idx].reader_mask.load(Ordering::Acquire);
         self.states[next_idx]
             .next_slab_idx
@@ -129,6 +229,9 @@ impl Core {
         self.states[next_idx]
             .reader_mask
             .fetch_or(reader_mask, Ordering::Release);
+
+        sfence();
+
         self.states[current_idx]
             .next_slab_idx
             .store(next_idx, Ordering::Release);
@@ -136,16 +239,18 @@ impl Core {
         self.write_cursor
             .slab_idx
             .store(next_idx, Ordering::Release);
+
+        if reader_mask == 0 {
+            self.push_free(current_idx);
+        }
+
         (next_idx, unsafe { self.slabs_base.add(next_idx) })
     }
 
     /// Single-Writer Fast Loop: Linearly slices and fragments raw byte payloads across slabs.
-    ///
-    /// # Safety
-    /// The caller must serialize all calls for this `Core` to one producer.
     #[inline(always)]
     pub unsafe fn append_bytes(&self, mut bytes: &[u8]) {
-        let mut idx = self.write_cursor.slab_idx.load(Ordering::Acquire);
+        let mut idx = self.write_cursor.slab_idx.load(Ordering::Relaxed);
         let mut offset = self.write_cursor.offset.load(Ordering::Relaxed);
         #[cfg(feature = "telemetry")]
         let start_mark = Instant::now();
@@ -176,7 +281,7 @@ impl Core {
 
                 let dst = (*current_slab).data.as_mut_ptr().add(offset);
                 ptr::copy_nonoverlapping(&packed_header as *const u32 as *const u8, dst, 4);
-                ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(4), chunk_len);
+                copy_streaming(bytes.as_ptr(), dst.add(4), chunk_len);
 
                 offset += 4 + chunk_len;
                 bytes = &bytes[chunk_len..];
@@ -188,6 +293,7 @@ impl Core {
                     offset = 0;
                 }
             }
+            sfence();
             self.write_cursor.offset.store(offset, Ordering::Release);
         }
 
@@ -204,22 +310,6 @@ impl Core {
             self.writer_metrics
                 .total_duration
                 .fetch_add(duration, Ordering::Relaxed);
-        }
-    }
-
-    #[inline(always)]
-    fn route_next_free_index(&self, current: usize) -> usize {
-        let total = self.pool_cap;
-        let mut scan = (current + 1) % total;
-
-        loop {
-            if self.states[scan].reader_mask.load(Ordering::Acquire) == 0 {
-                return scan;
-            }
-            scan = (scan + 1) % total;
-            if scan == current {
-                std::thread::yield_now(); // Core protection fallback loop execution
-            }
         }
     }
 
@@ -288,9 +378,17 @@ impl ReaderHandle {
         core.states[next_idx]
             .reader_mask
             .fetch_or(mask_bit, Ordering::Relaxed);
-        core.states[idx]
+        let prev_mask = core.states[idx]
             .reader_mask
             .fetch_and(!mask_bit, Ordering::Release);
+
+        // If clearing our bit dropped the mask to zero, we were the last reader still
+        // referencing this slab — hand it back to the writer's free stack. Any other
+        // pinned reader will already have caught up and left by the time this happens,
+        // since the writer only ever forwards pins ahead of itself, never backward.
+        if prev_mask & !mask_bit == 0 {
+            core.push_free(idx);
+        }
 
         self.current_slab_idx.set(next_idx);
         self.current_offset.set(0);

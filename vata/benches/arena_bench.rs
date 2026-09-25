@@ -3,6 +3,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 use vata::arena_alloc::{Core, ReaderHandle};
+
 fn bench_core_storage_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("Core_Storage_Engine");
 
@@ -50,6 +51,52 @@ fn bench_core_storage_throughput(c: &mut Criterion) {
 
             // Block until reader thread finishes pulling all data out of line
             reader_thread.join().unwrap();
+            start.elapsed()
+        });
+    });
+
+    // 3. Free-Stack Reclamation Under Contention: many slabs, several lagging readers,
+    // forcing frequent rollovers and frequent push/pop traffic on the free-slab stack.
+    // This targets the O(1) reclamation path directly (previously an O(pool_cap) linear
+    // scan), so a regression in that path shows up here even when the two benchmarks
+    // above look unaffected — they exercise mostly-uncontended rollover, this one
+    // exercises the case multiple readers are racing to push freed slabs back
+    // concurrently while the writer pops from the same stack.
+    group.bench_function("free_stack_reclaim_many_slabs_multi_reader", |b| {
+        b.iter_custom(|iters| {
+            const READERS: usize = 4;
+            const RECORD_SIZE: usize = 256;
+
+            // Small slab pool relative to payload volume maximizes rollover frequency,
+            // i.e. maximizes free-stack push/pop traffic per byte written.
+            let core = Arc::new(Core::new(32, READERS));
+            let readers: Vec<_> = (0..READERS)
+                .map(|id| unsafe { ReaderHandle::new(Arc::clone(&core), id) })
+                .collect();
+
+            let reader_threads: Vec<_> = readers
+                .into_iter()
+                .map(|reader| {
+                    thread::spawn(move || {
+                        let mut out_buf = vec![0u8; RECORD_SIZE];
+                        let mut total_read = 0usize;
+                        let target_bytes = iters as usize * RECORD_SIZE;
+                        while total_read < target_bytes {
+                            total_read += reader.read_next_blocking(&mut out_buf);
+                        }
+                    })
+                })
+                .collect();
+
+            let start = std::time::Instant::now();
+            let write_payload = vec![b'E'; RECORD_SIZE];
+            for _ in 0..iters {
+                unsafe { core.append_bytes(&write_payload) };
+            }
+
+            for handle in reader_threads {
+                handle.join().unwrap();
+            }
             start.elapsed()
         });
     });
