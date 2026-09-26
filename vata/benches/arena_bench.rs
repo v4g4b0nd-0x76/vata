@@ -2,7 +2,11 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
+use tikv_jemallocator::Jemalloc;
 use vata::arena_alloc::{Core, ReaderHandle};
+
+#[global_allocator]
+static ALLOCATOR: Jemalloc = Jemalloc;
 
 fn bench_core_storage_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("Core_Storage_Engine");

@@ -3,7 +3,9 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::{mem::align_of, mem::size_of};
 
-use crate::arena_alloc::{CACHE_LINE, Core, ReaderHandle, SLAB_SIZE, SlabState, WriteCursor};
+use crate::arena_alloc::{
+    CACHE_LINE, Core, ReaderHandle, SLAB_SIZE, SlabState, WriteCursor, pack_cursor, unpack_cursor,
+};
 
 /// Helper function mirroring the exact FNV-1a checksum routine for data verification
 fn calculate_checksum(bytes: &[u8]) -> usize {
@@ -25,7 +27,7 @@ fn test_multislab_spanning_and_integrity_verification() {
     unsafe { core.append_bytes(&test_payload) };
 
     // Validate that the writer advanced past index 0 due to the size of the payload
-    let final_write_idx = core.write_cursor.slab_idx.load(Ordering::Acquire);
+    let (final_write_idx, _) = core.write_cursor.load(Ordering::Acquire);
     assert!(
         final_write_idx > 0,
         "Writer layout failed to split data across slab boundaries!"
@@ -64,6 +66,16 @@ fn test_control_words_are_cache_line_isolated() {
     {
         assert_eq!(align_of::<crate::arena_alloc::TelemetryShard>(), CACHE_LINE);
         assert_eq!(size_of::<crate::arena_alloc::TelemetryShard>(), CACHE_LINE);
+    }
+}
+
+#[test]
+fn test_packed_cursor_round_trips_slab_and_offset() {
+    for (slab_idx, offset) in [(0, 0), (1, 1024), (31, SLAB_SIZE - CACHE_LINE - 4)] {
+        assert_eq!(
+            unpack_cursor(pack_cursor(slab_idx, offset)),
+            (slab_idx, offset)
+        );
     }
 }
 
@@ -248,7 +260,7 @@ fn test_free_stack_reclaims_across_many_ring_laps_with_no_readers() {
         unsafe { core.append_bytes(&payload) };
     }
 
-    let final_idx = core.write_cursor.slab_idx.load(Ordering::Acquire);
+    let (final_idx, _) = core.write_cursor.load(Ordering::Acquire);
     assert!(final_idx < 4, "writer index must stay within the slab pool");
 }
 
@@ -274,7 +286,7 @@ fn test_free_stack_waits_for_a_lagging_reader_before_reuse() {
     // moved), so it must not have been handed back onto the free stack — the writer
     // must still land on slab 2, a genuinely free slab, not reuse the pinned one.
     unsafe { core.append_bytes(&vec![b'D'; SLAB_SIZE - CACHE_LINE]) };
-    let final_idx = core.write_cursor.slab_idx.load(Ordering::Acquire);
+    let (final_idx, _) = core.write_cursor.load(Ordering::Acquire);
     assert_eq!(
         final_idx, 2,
         "writer must advance to the next free slab, not reuse the still-pinned one"

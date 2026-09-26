@@ -11,6 +11,9 @@ pub const SLAB_SIZE: usize = 2 * 1024 * 1024;
 pub const MASK_CONTINUATION: u32 = 1 << 31; // Highest bit = Spanning Continuation indicator
 pub const MASK_LENGTH: u32 = !MASK_CONTINUATION; // Lower 31 bits = Data Chunk Length
 const NO_SUCCESSOR: usize = usize::MAX;
+const CURSOR_OFFSET_BITS: u32 = SLAB_SIZE.trailing_zeros();
+const CURSOR_OFFSET_MASK: u64 = (SLAB_SIZE - 1) as u64;
+const MAX_CURSOR_SLAB_INDEX: usize = (u64::MAX >> CURSOR_OFFSET_BITS) as usize;
 
 #[repr(C, align(64))]
 pub struct Slab {
@@ -50,8 +53,39 @@ impl Default for SlabState {
 
 #[repr(C, align(64))]
 pub(crate) struct WriteCursor {
-    pub(crate) slab_idx: AtomicUsize,
-    pub(crate) offset: AtomicUsize,
+    value: AtomicU64,
+}
+
+#[inline(always)]
+pub(crate) fn pack_cursor(slab_idx: usize, offset: usize) -> u64 {
+    debug_assert!(offset < SLAB_SIZE);
+    ((slab_idx as u64) << CURSOR_OFFSET_BITS) | offset as u64
+}
+
+#[inline(always)]
+pub(crate) fn unpack_cursor(value: u64) -> (usize, usize) {
+    (
+        (value >> CURSOR_OFFSET_BITS) as usize,
+        (value & CURSOR_OFFSET_MASK) as usize,
+    )
+}
+
+impl WriteCursor {
+    fn new(slab_idx: usize, offset: usize) -> Self {
+        Self {
+            value: AtomicU64::new(pack_cursor(slab_idx, offset)),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn load(&self, order: Ordering) -> (usize, usize) {
+        unpack_cursor(self.value.load(order))
+    }
+
+    #[inline(always)]
+    fn store(&self, slab_idx: usize, offset: usize, order: Ordering) {
+        self.value.store(pack_cursor(slab_idx, offset), order);
+    }
 }
 
 pub struct Core {
@@ -126,6 +160,10 @@ fn sfence() {
 impl Core {
     pub fn new(cap: usize, max_readers: usize) -> Self {
         assert!(cap >= 2, "arena requires at least two slabs");
+        assert!(
+            cap <= MAX_CURSOR_SLAB_INDEX,
+            "arena capacity exceeds packed cursor range"
+        );
         let layout = std::alloc::Layout::array::<Slab>(cap).unwrap();
         let slabs_base = unsafe { std::alloc::alloc_zeroed(layout) as *mut Slab };
         if slabs_base.is_null() {
@@ -155,10 +193,7 @@ impl Core {
             states,
             pool_cap: cap,
             reader_capacity: max_readers,
-            write_cursor: WriteCursor {
-                slab_idx: AtomicUsize::new(0),
-                offset: AtomicUsize::new(0),
-            },
+            write_cursor: WriteCursor::new(0, 0),
             free_head,
             #[cfg(feature = "telemetry")]
             writer_metrics: Arc::new(TelemetryShard::default()),
@@ -235,10 +270,7 @@ impl Core {
         self.states[current_idx]
             .next_slab_idx
             .store(next_idx, Ordering::Release);
-        self.write_cursor.offset.store(0, Ordering::Release);
-        self.write_cursor
-            .slab_idx
-            .store(next_idx, Ordering::Release);
+        self.write_cursor.store(next_idx, 0, Ordering::Release);
 
         if reader_mask == 0 {
             self.push_free(current_idx);
@@ -250,8 +282,7 @@ impl Core {
     /// Single-Writer Fast Loop: Linearly slices and fragments raw byte payloads across slabs.
     #[inline(always)]
     pub unsafe fn append_bytes(&self, mut bytes: &[u8]) {
-        let mut idx = self.write_cursor.slab_idx.load(Ordering::Relaxed);
-        let mut offset = self.write_cursor.offset.load(Ordering::Relaxed);
+        let (mut idx, mut offset) = self.write_cursor.load(Ordering::Relaxed);
         #[cfg(feature = "telemetry")]
         let start_mark = Instant::now();
         #[cfg(feature = "telemetry")]
@@ -294,7 +325,7 @@ impl Core {
                 }
             }
             sfence();
-            self.write_cursor.offset.store(offset, Ordering::Release);
+            self.write_cursor.store(idx, offset, Ordering::Release);
         }
 
         #[cfg(feature = "telemetry")]
@@ -407,8 +438,8 @@ impl ReaderHandle {
 
         unsafe {
             let slab_ptr = loop {
-                let global_write_idx = core.write_cursor.slab_idx.load(Ordering::Acquire);
-                let global_write_offset = core.write_cursor.offset.load(Ordering::Acquire);
+                let (global_write_idx, global_write_offset) =
+                    core.write_cursor.load(Ordering::Acquire);
 
                 if idx != global_write_idx || offset < global_write_offset {
                     let slab_ptr = core.slabs_base.add(idx);

@@ -1,8 +1,9 @@
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
+use tikv_jemallocator::Jemalloc;
 use vata::arena_alloc::{Core, ReaderHandle};
 
 const RECORDS: usize = 2_000_000;
@@ -13,6 +14,8 @@ const BATCH_BYTES: usize = BATCH_RECORDS * RECORD_SIZE;
 
 struct CountingAllocator;
 
+static JEMALLOC: Jemalloc = Jemalloc;
+
 static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
 static ALLOCATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -20,21 +23,21 @@ static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_allocation(layout.size());
-        unsafe { System.alloc(layout) }
+        unsafe { JEMALLOC.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record_allocation(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { JEMALLOC.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { JEMALLOC.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record_allocation(new_size);
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { JEMALLOC.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -80,7 +83,6 @@ fn main() {
     let start = Arc::new(Barrier::new(READERS + 1));
     let completed_readers = Arc::new(AtomicUsize::new(0));
     let release_reader_results = Arc::new(AtomicBool::new(false));
-
     start_allocation_count();
     let core = Arc::new(Core::new(16, READERS));
     let readers: Vec<_> = (0..READERS)
