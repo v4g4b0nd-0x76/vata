@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 telemetry = []
+xdp = ["dep:aya", "dep:xdp"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
@@ -20,6 +21,13 @@ tokio = { version = "1.52.3", default-features = false, features = [
     "time",
 ] }
 toml = "1.1.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14", optional = true }
+xdp = { version = "0.8", optional = true }
+
+[build-dependencies]
+aya-build = "0.2.0"
 [[bench]]
 name = "arena_bench"
 harness = false
@@ -30,9 +38,3 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[profile.release]
-opt-level = 3
-lto = "fat" 
-codegen-units = 1
-panic = "abort"
