@@ -6,7 +6,6 @@ use crate::VataErr;
 pub struct Conf {
     pub core_conf: CoreConf,
     pub telemetry_conf: TelemetryConf,
-    #[serde(rename = "xdp")]
     pub xdp_conf: Option<XdpConf>,
 }
 #[derive(Deserialize, Default)]
@@ -16,7 +15,7 @@ pub struct TelemetryConf {
 #[derive(Deserialize)]
 pub struct CoreConf {
     pub max_readers: usize,
-    pub cap: usize,
+    pub cap: usize, // user provide gb of pre-alloc we convert to number of slabs
 }
 #[derive(Deserialize)]
 pub struct XdpConf {
@@ -49,7 +48,7 @@ mod tests {
             [telemetry_conf]
             report_interval_ms = 1000
 
-            [xdp]
+            [xdp_conf]
             interface = "eth0"
             udp_port = 5353
             "#,

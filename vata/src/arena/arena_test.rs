@@ -57,6 +57,49 @@ fn test_multislab_spanning_and_integrity_verification() {
 }
 
 #[test]
+fn test_batch_writer_preserves_each_record_boundary() {
+    let core = Arc::new(Core::new(2, 1));
+    let reader = unsafe { ReaderHandle::new(Arc::clone(&core), 0) };
+
+    unsafe {
+        core.append_batch(|writer| {
+            writer.append(b"first");
+            writer.append(b"second");
+        });
+    }
+
+    let mut first = [0; 5];
+    assert_eq!(reader.read_next_blocking(&mut first), 5);
+    assert_eq!(&first, b"first");
+
+    let mut second = [0; 6];
+    assert_eq!(reader.read_next_blocking(&mut second), 6);
+    assert_eq!(&second, b"second");
+}
+
+#[test]
+fn test_batch_writer_rolls_over_without_merging_records() {
+    let core = Arc::new(Core::new(3, 1));
+    let reader = unsafe { ReaderHandle::new(Arc::clone(&core), 0) };
+    let first = vec![b'A'; SLAB_SIZE - CACHE_LINE - 8];
+
+    unsafe {
+        core.append_batch(|writer| {
+            writer.append(&first);
+            writer.append(b"next");
+        });
+    }
+
+    let mut first_out = vec![0; first.len()];
+    assert_eq!(reader.read_next_blocking(&mut first_out), first.len());
+    assert_eq!(first_out, first);
+
+    let mut second_out = [0; 4];
+    assert_eq!(reader.read_next_blocking(&mut second_out), 4);
+    assert_eq!(&second_out, b"next");
+}
+
+#[test]
 fn test_control_words_are_cache_line_isolated() {
     assert_eq!(align_of::<WriteCursor>(), CACHE_LINE);
     assert_eq!(size_of::<WriteCursor>(), CACHE_LINE);

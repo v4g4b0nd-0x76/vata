@@ -11,6 +11,7 @@ const READERS: usize = 4;
 const RECORD_SIZE: usize = 1024;
 const BATCH_RECORDS: usize = 100_000;
 const BATCH_BYTES: usize = BATCH_RECORDS * RECORD_SIZE;
+const INGEST_BATCH_RECORDS: usize = 64;
 
 struct CountingAllocator;
 
@@ -133,8 +134,15 @@ fn main() {
     start_allocation_count();
     start.wait();
     let mut batch_start = Instant::now();
-    for record in 1..=RECORDS {
-        unsafe { core.append_bytes(&payload) };
+    for batch in 1..=RECORDS / INGEST_BATCH_RECORDS {
+        unsafe {
+            core.append_batch(|writer| {
+                for _ in 0..INGEST_BATCH_RECORDS {
+                    writer.append(&payload);
+                }
+            });
+        }
+        let record = batch * INGEST_BATCH_RECORDS;
         if record % BATCH_RECORDS == 0 {
             write_batches.push(batch_start.elapsed());
             batch_start = Instant::now();
@@ -149,7 +157,9 @@ fn main() {
         read_batches.extend(worker.join().unwrap());
     }
 
-    println!("records: {RECORDS}, readers: {READERS}, batch: {BATCH_RECORDS}");
+    println!(
+        "records: {RECORDS}, readers: {READERS}, ingest batch: {INGEST_BATCH_RECORDS}, report batch: {BATCH_RECORDS}"
+    );
     println!(
         "setup allocations: {} calls, {} bytes",
         setup_allocations.0, setup_allocations.1

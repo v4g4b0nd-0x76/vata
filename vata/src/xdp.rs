@@ -1,4 +1,4 @@
-use crate::{VataErr, XdpConf};
+use crate::{VataErr, XdpConf, arena_alloc::Core};
 
 #[cfg(all(feature = "xdp", target_os = "linux"))]
 mod linux {
@@ -12,17 +12,19 @@ mod linux {
     use xdp::{
         Umem,
         nic::NicIndex,
-        socket::XdpSocket,
+        slab::{Slab, StackSlab},
+        socket::{PollTimeout, XdpSocket},
         {RingConfigBuilder, Rings},
     };
 
     const EBPF: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/vata-ebpf"));
+    const BATCH_SIZE: usize = 64;
 
     pub struct XdpIngress {
         _bpf: Ebpf,
-        _socket: XdpSocket,
-        _umem: Umem,
-        _rings: Rings,
+        socket: XdpSocket,
+        umem: Umem,
+        rings: Rings,
     }
 
     fn failed(error: impl std::fmt::Display) -> VataErr {
@@ -44,7 +46,6 @@ mod linux {
         let (mut rings, mut bind_flags) = builder
             .build_rings(&umem, RingConfigBuilder::default().build().map_err(failed)?)
             .map_err(failed)?;
-        // ponytail: RX frames are seeded but never reclaimed; add a receive worker before live traffic.
         if unsafe { rings.fill_ring.enqueue(&mut umem, 2048) } == 0 {
             return Err(failed("AF_XDP fill ring accepted no frames"));
         }
@@ -76,10 +77,49 @@ mod linux {
 
         Ok(XdpIngress {
             _bpf: bpf,
-            _socket: socket,
-            _umem: umem,
-            _rings: rings,
+            socket,
+            umem,
+            rings,
         })
+    }
+
+    impl XdpIngress {
+        pub fn run(&mut self, core: &Core) -> Result<(), VataErr> {
+            let rx = self
+                .rings
+                .rx_ring
+                .as_mut()
+                .ok_or_else(|| failed("AF_XDP receive ring is disabled"))?;
+            let mut packets = StackSlab::<BATCH_SIZE>::new();
+
+            loop {
+                if !self
+                    .socket
+                    .poll_read(PollTimeout::new(None))
+                    .map_err(failed)?
+                {
+                    continue;
+                }
+
+                let received = unsafe { rx.recv(&self.umem, &mut packets) };
+                unsafe {
+                    core.append_batch(|writer| {
+                        while let Some(packet) = packets.pop_back() {
+                            writer.append(&packet);
+                            self.umem.free_packet(packet);
+                        }
+                    });
+                }
+
+                if received != 0
+                    && unsafe { self.rings.fill_ring.enqueue(&mut self.umem, received) } != received
+                {
+                    return Err(failed(
+                        "AF_XDP fill ring could not recycle every received frame",
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -94,6 +134,15 @@ pub fn start(_: &XdpConf) -> Result<XdpIngress, VataErr> {
     Err(VataErr::XdpUnavailable(
         "rebuild on Linux with --features xdp".to_owned(),
     ))
+}
+
+#[cfg(not(all(feature = "xdp", target_os = "linux")))]
+impl XdpIngress {
+    pub fn run(&mut self, _: &Core) -> Result<(), VataErr> {
+        Err(VataErr::XdpUnavailable(
+            "rebuild on Linux with --features xdp".to_owned(),
+        ))
+    }
 }
 
 #[cfg(all(test, not(all(feature = "xdp", target_os = "linux"))))]

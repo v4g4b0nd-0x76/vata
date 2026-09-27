@@ -105,6 +105,20 @@ pub struct Core {
 unsafe impl Sync for Core {}
 unsafe impl Send for Core {}
 
+/// A single-producer write session. One release publish covers every record appended to it.
+pub struct CoreWriter<'a> {
+    core: &'a Core,
+    idx: usize,
+    offset: usize,
+    current_slab: *mut Slab,
+    #[cfg(feature = "telemetry")]
+    start_mark: Instant,
+    #[cfg(feature = "telemetry")]
+    ops_count: usize,
+    #[cfg(feature = "telemetry")]
+    bytes_processed: usize,
+}
+
 pub struct ReaderHandle {
     core: Arc<Core>,
     client_id: usize,
@@ -279,69 +293,31 @@ impl Core {
         (next_idx, unsafe { self.slabs_base.add(next_idx) })
     }
 
-    /// Single-Writer Fast Loop: Linearly slices and fragments raw byte payloads across slabs.
+    /// Starts a single-producer write batch. Records remain independently readable, but the
+    /// cursor is published once after the closure returns.
     #[inline(always)]
-    pub unsafe fn append_bytes(&self, mut bytes: &[u8]) {
-        let (mut idx, mut offset) = self.write_cursor.load(Ordering::Relaxed);
-        #[cfg(feature = "telemetry")]
-        let start_mark = Instant::now();
-        #[cfg(feature = "telemetry")]
-        let initial_len = bytes.len();
+    pub unsafe fn append_batch(&self, write: impl FnOnce(&mut CoreWriter<'_>)) {
+        let (idx, offset) = self.write_cursor.load(Ordering::Relaxed);
+        let mut writer = CoreWriter {
+            core: self,
+            idx,
+            offset,
+            current_slab: unsafe { self.slabs_base.add(idx) },
+            #[cfg(feature = "telemetry")]
+            start_mark: Instant::now(),
+            #[cfg(feature = "telemetry")]
+            ops_count: 0,
+            #[cfg(feature = "telemetry")]
+            bytes_processed: 0,
+        };
+        write(&mut writer);
+        unsafe { writer.finish() };
+    }
 
-        unsafe {
-            let mut current_slab = self.slabs_base.add(idx);
-
-            while !bytes.is_empty() {
-                let available = (*current_slab).data.len() - offset;
-
-                // Checked via cold function call to manipulate compiler basic blocks
-                if available <= 4 {
-                    let (new_idx, new_slab) = self.handle_write_rollover(idx, offset, current_slab);
-                    idx = new_idx;
-                    current_slab = new_slab;
-                    offset = 0;
-                    continue;
-                }
-
-                let max_payload = available - 4;
-                let chunk_len = bytes.len().min(max_payload);
-
-                // Branchless mathematical flag determination
-                let is_cont = (chunk_len < bytes.len()) as u32;
-                let packed_header = chunk_len as u32 | (is_cont << 31);
-
-                let dst = (*current_slab).data.as_mut_ptr().add(offset);
-                ptr::copy_nonoverlapping(&packed_header as *const u32 as *const u8, dst, 4);
-                copy_streaming(bytes.as_ptr(), dst.add(4), chunk_len);
-
-                offset += 4 + chunk_len;
-                bytes = &bytes[chunk_len..];
-
-                if (packed_header & MASK_CONTINUATION) != 0 {
-                    let (new_idx, new_slab) = self.handle_write_rollover(idx, offset, current_slab);
-                    idx = new_idx;
-                    current_slab = new_slab;
-                    offset = 0;
-                }
-            }
-            sfence();
-            self.write_cursor.store(idx, offset, Ordering::Release);
-        }
-
-        #[cfg(feature = "telemetry")]
-        {
-            // Cache-Isolated Writer Telemetry update
-            let duration = start_mark.elapsed().as_nanos() as u64;
-            self.writer_metrics
-                .ops_count
-                .fetch_add(1, Ordering::Relaxed);
-            self.writer_metrics
-                .bytes_processed
-                .fetch_add(initial_len, Ordering::Relaxed);
-            self.writer_metrics
-                .total_duration
-                .fetch_add(duration, Ordering::Relaxed);
-        }
+    /// Single-record convenience path for callers that do not already have a batch.
+    #[inline(always)]
+    pub unsafe fn append_bytes(&self, bytes: &[u8]) {
+        unsafe { self.append_batch(|writer| writer.append(bytes)) };
     }
 
     #[cfg(test)]
@@ -362,6 +338,77 @@ impl Core {
 
             (*checksum_field).store(hash, Ordering::Release);
             (*written_bytes_field).store(offset, Ordering::Release);
+        }
+    }
+}
+
+impl CoreWriter<'_> {
+    /// Appends one independently readable record without allocating. The enclosing
+    /// `Core::append_batch` call is responsible for the single-writer invariant.
+    #[inline(always)]
+    pub fn append(&mut self, mut bytes: &[u8]) {
+        #[cfg(feature = "telemetry")]
+        {
+            self.ops_count += 1;
+            self.bytes_processed += bytes.len();
+        }
+
+        unsafe {
+            while !bytes.is_empty() {
+                let available = (*self.current_slab).data.len() - self.offset;
+                if available <= 4 {
+                    let (idx, slab) =
+                        self.core
+                            .handle_write_rollover(self.idx, self.offset, self.current_slab);
+                    self.idx = idx;
+                    self.current_slab = slab;
+                    self.offset = 0;
+                    continue;
+                }
+
+                let chunk_len = bytes.len().min(available - 4);
+                let packed_header = chunk_len as u32 | ((chunk_len < bytes.len()) as u32) << 31;
+                let dst = (*self.current_slab).data.as_mut_ptr().add(self.offset);
+                ptr::copy_nonoverlapping(&packed_header as *const u32 as *const u8, dst, 4);
+                copy_streaming(bytes.as_ptr(), dst.add(4), chunk_len);
+
+                self.offset += 4 + chunk_len;
+                bytes = &bytes[chunk_len..];
+
+                if (packed_header & MASK_CONTINUATION) != 0 {
+                    let (idx, slab) =
+                        self.core
+                            .handle_write_rollover(self.idx, self.offset, self.current_slab);
+                    self.idx = idx;
+                    self.current_slab = slab;
+                    self.offset = 0;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(self) {
+        sfence();
+        self.core
+            .write_cursor
+            .store(self.idx, self.offset, Ordering::Release);
+
+        #[cfg(feature = "telemetry")]
+        {
+            let duration = self.start_mark.elapsed().as_nanos() as u64;
+            self.core
+                .writer_metrics
+                .ops_count
+                .fetch_add(self.ops_count, Ordering::Relaxed);
+            self.core
+                .writer_metrics
+                .bytes_processed
+                .fetch_add(self.bytes_processed, Ordering::Relaxed);
+            self.core
+                .writer_metrics
+                .total_duration
+                .fetch_add(duration, Ordering::Relaxed);
         }
     }
 }

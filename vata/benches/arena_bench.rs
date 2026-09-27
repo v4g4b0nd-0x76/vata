@@ -23,10 +23,10 @@ fn bench_core_storage_throughput(c: &mut Criterion) {
         });
     });
 
-    // 2. High-Contention Asynchronous Coordination: Benchmark concurrent read/write execution.
-    // This measures the efficiency of the cache-friendly exponential busy-spin backoff loop.
-    group.bench_function("concurrent_busy_spin_read_write", |b| {
+    // 2. The same writer/reader handoff used by AF_XDP: one cursor publication per 64 records.
+    group.bench_function("concurrent_busy_spin_read_write_batch_64", |b| {
         b.iter_custom(|iters| {
+            const BATCH_RECORDS: usize = 64;
             // Allocate a ring of 16 slabs supporting 1 dedicated reader thread
             let core = Arc::new(Core::new(16, 1));
             let reader = unsafe { ReaderHandle::new(Arc::clone(&core), 0) };
@@ -36,7 +36,7 @@ fn bench_core_storage_throughput(c: &mut Criterion) {
                 // Track exactly how many bytes the writer will output over the fixed iteration loop
                 let mut out_buf = vec![0u8; 1024];
                 let mut total_read = 0;
-                let target_bytes = iters as usize * 1024;
+                let target_bytes = iters as usize * BATCH_RECORDS * 1024;
 
                 while total_read < target_bytes {
                     let n = reader.read_next_blocking(&mut out_buf);
@@ -50,7 +50,13 @@ fn bench_core_storage_throughput(c: &mut Criterion) {
             let write_payload = vec![b'B'; 1024];
 
             for _ in 0..iters {
-                unsafe { core.append_bytes(&write_payload) };
+                unsafe {
+                    core.append_batch(|writer| {
+                        for _ in 0..BATCH_RECORDS {
+                            writer.append(&write_payload);
+                        }
+                    });
+                }
             }
 
             // Block until reader thread finishes pulling all data out of line
