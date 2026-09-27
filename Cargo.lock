@@ -921,7 +921,6 @@ dependencies = [
 name = "vata-ebpf"
 version = "0.1.0"
 dependencies = [
- "aya-build",
  "aya-ebpf",
 ]
 

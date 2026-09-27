@@ -1,5 +1,6 @@
 mod arena;
 mod conf;
+pub mod xdp;
 use std::fmt::Display;
 
 pub use arena::*;

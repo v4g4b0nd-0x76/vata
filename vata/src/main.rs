@@ -11,6 +11,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 async fn main() -> Result<(), VataErr> {
     let conf = Arc::new(Conf::load()?);
     let arena = Arc::new(Core::new(conf.core_conf.cap, conf.core_conf.max_readers));
+    let _xdp = match conf.xdp_conf.as_ref() {
+        Some(config) => Some(vata::xdp::start(config)?),
+        None => None,
+    };
 
     #[cfg(feature = "telemetry")]
     let telemetry_opts = ReportTelemetryOpts {
