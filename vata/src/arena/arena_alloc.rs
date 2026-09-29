@@ -128,8 +128,7 @@ pub struct ReaderHandle {
 
 /// Streams `len` bytes from `src` to `dst`, using non-temporal (write-combining) stores
 /// when the `non_temporal_writes` Cargo feature is enabled on x86_64, and a plain
-/// `copy_nonoverlapping` everywhere else (this feature does not exist yet — add
-/// `non_temporal_writes = []` under `[features]` in Cargo.toml to opt in).
+/// `copy_nonoverlapping` everywhere else.
 #[inline(always)]
 unsafe fn copy_streaming(src: *const u8, dst: *mut u8, len: usize) {
     #[cfg(all(feature = "non_temporal_writes", target_arch = "x86_64"))]

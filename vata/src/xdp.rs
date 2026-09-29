@@ -43,13 +43,12 @@ mod linux {
         )
         .map_err(failed)?;
         let mut builder = xdp::socket::XdpSocketBuilder::new().map_err(failed)?;
-        let (mut rings, mut bind_flags) = builder
+        let (mut rings, bind_flags) = builder
             .build_rings(&umem, RingConfigBuilder::default().build().map_err(failed)?)
             .map_err(failed)?;
         if unsafe { rings.fill_ring.enqueue(&mut umem, 2048) } == 0 {
             return Err(failed("AF_XDP fill ring accepted no frames"));
         }
-        bind_flags.force_zerocopy();
         let socket = builder.bind(nic, 0, bind_flags).map_err(failed)?;
 
         let mut bpf = Ebpf::load(EBPF).map_err(failed)?;
@@ -72,7 +71,7 @@ mod linux {
             .map_err(failed)?;
         program.load().map_err(failed)?;
         program
-            .attach(&config.interface, XdpMode::Driver)
+            .attach(&config.interface, XdpMode::Default)
             .map_err(failed)?;
 
         Ok(XdpIngress {

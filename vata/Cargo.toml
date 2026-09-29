@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 telemetry = []
 xdp = ["dep:aya", "dep:xdp"]
+non_temporal_writes = []
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
