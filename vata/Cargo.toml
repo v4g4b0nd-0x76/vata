@@ -7,9 +7,12 @@ edition = "2024"
 telemetry = []
 xdp = ["dep:aya", "dep:xdp"]
 non_temporal_writes = []
+udp_listener = []
 
 [dependencies]
+libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 tikv-jemallocator = "0.6"
 tokio = { version = "1.52.3", default-features = false, features = [
     "rt",

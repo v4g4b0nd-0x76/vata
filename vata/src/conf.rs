@@ -7,6 +7,13 @@ pub struct Conf {
     pub core_conf: CoreConf,
     pub telemetry_conf: TelemetryConf,
     pub xdp_conf: Option<XdpConf>,
+    pub udp_listener: Option<UdpListener>,
+}
+#[derive(Deserialize, Default)]
+pub struct UdpListener {
+    pub port: u16,
+    pub processor: usize,
+    pub receiver: usize,
 }
 #[derive(Deserialize, Default)]
 pub struct TelemetryConf {

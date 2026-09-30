@@ -4,7 +4,8 @@ use std::thread;
 use std::{mem::align_of, mem::size_of};
 
 use crate::arena_alloc::{
-    CACHE_LINE, Core, ReaderHandle, SLAB_SIZE, SlabState, WriteCursor, pack_cursor, unpack_cursor,
+    CACHE_LINE, Core, ReaderHandle, ReaderSet, SLAB_SIZE, SlabState, WriteCursor, pack_cursor,
+    unpack_cursor,
 };
 
 /// Helper function mirroring the exact FNV-1a checksum routine for data verification
@@ -27,7 +28,7 @@ fn test_multislab_spanning_and_integrity_verification() {
     unsafe { core.append_bytes(&test_payload) };
 
     // Validate that the writer advanced past index 0 due to the size of the payload
-    let (final_write_idx, _) = core.write_cursor.load(Ordering::Acquire);
+    let (final_write_idx, _) = core.write_cursors[0].load(Ordering::Acquire);
     assert!(
         final_write_idx > 0,
         "Writer layout failed to split data across slab boundaries!"
@@ -97,6 +98,74 @@ fn test_batch_writer_rolls_over_without_merging_records() {
     let mut second_out = [0; 4];
     assert_eq!(reader.read_next_blocking(&mut second_out), 4);
     assert_eq!(&second_out, b"next");
+}
+
+#[test]
+fn test_writer_lanes_publish_every_record_to_each_reader() {
+    let core = Arc::new(Core::new_with_lanes(4, 2, 2));
+    let first_reader = unsafe { ReaderSet::new(Arc::clone(&core), 0) };
+    let second_reader = unsafe { ReaderSet::new(Arc::clone(&core), 1) };
+    let mut writers = core.writer_lanes();
+    let mut first_writer = writers.remove(0);
+    let mut second_writer = writers.remove(0);
+
+    let first = thread::spawn(move || {
+        first_writer.append_batch(|writer| {
+            writer.append(b"left");
+            writer.append(b"left2");
+        });
+    });
+    let second = thread::spawn(move || {
+        second_writer.append_batch(|writer| {
+            writer.append(b"right");
+            writer.append(b"right2");
+        });
+    });
+    first.join().unwrap();
+    second.join().unwrap();
+
+    for reader in [first_reader, second_reader] {
+        let mut records = Vec::new();
+        for _ in 0..4 {
+            let mut out = [0; 6];
+            let read = reader.read_next_blocking(&mut out);
+            records.push(out[..read].to_vec());
+        }
+        records.sort();
+        assert_eq!(
+            records,
+            vec![
+                b"left".to_vec(),
+                b"left2".to_vec(),
+                b"right".to_vec(),
+                b"right2".to_vec(),
+            ]
+        );
+    }
+}
+
+#[test]
+fn test_writer_lanes_reclaim_the_shared_pool_without_readers() {
+    let core = Arc::new(Core::new_with_lanes(3, 0, 2));
+    let mut writers = core.writer_lanes();
+    let mut first_writer = writers.remove(0);
+    let mut second_writer = writers.remove(0);
+    let first_payload = vec![b'L'; SLAB_SIZE - CACHE_LINE];
+    let second_payload = vec![b'R'; SLAB_SIZE - CACHE_LINE];
+
+    let first = thread::spawn(move || {
+        for _ in 0..8 {
+            first_writer.append_bytes(&first_payload);
+        }
+    });
+    let second = thread::spawn(move || {
+        for _ in 0..8 {
+            second_writer.append_bytes(&second_payload);
+        }
+    });
+
+    first.join().unwrap();
+    second.join().unwrap();
 }
 
 #[test]
@@ -303,7 +372,7 @@ fn test_free_stack_reclaims_across_many_ring_laps_with_no_readers() {
         unsafe { core.append_bytes(&payload) };
     }
 
-    let (final_idx, _) = core.write_cursor.load(Ordering::Acquire);
+    let (final_idx, _) = core.write_cursors[0].load(Ordering::Acquire);
     assert!(final_idx < 4, "writer index must stay within the slab pool");
 }
 
@@ -329,7 +398,7 @@ fn test_free_stack_waits_for_a_lagging_reader_before_reuse() {
     // moved), so it must not have been handed back onto the free stack — the writer
     // must still land on slab 2, a genuinely free slab, not reuse the pinned one.
     unsafe { core.append_bytes(&vec![b'D'; SLAB_SIZE - CACHE_LINE]) };
-    let (final_idx, _) = core.write_cursor.load(Ordering::Acquire);
+    let (final_idx, _) = core.write_cursors[0].load(Ordering::Acquire);
     assert_eq!(
         final_idx, 2,
         "writer must advance to the next free slab, not reuse the still-pinned one"

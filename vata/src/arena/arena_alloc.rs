@@ -1,7 +1,8 @@
 use std::cell::Cell;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
 #[cfg(feature = "telemetry")]
 use std::time::Instant;
 
@@ -14,6 +15,22 @@ const NO_SUCCESSOR: usize = usize::MAX;
 const CURSOR_OFFSET_BITS: u32 = SLAB_SIZE.trailing_zeros();
 const CURSOR_OFFSET_MASK: u64 = (SLAB_SIZE - 1) as u64;
 const MAX_CURSOR_SLAB_INDEX: usize = (u64::MAX >> CURSOR_OFFSET_BITS) as usize;
+const FREE_INDEX_BITS: u32 = 24;
+const FREE_INDEX_MASK: u64 = (1 << FREE_INDEX_BITS) - 1;
+const FREE_TAG_MASK: u64 = u64::MAX >> FREE_INDEX_BITS;
+const NO_FREE_SLAB: usize = FREE_INDEX_MASK as usize;
+
+#[inline(always)]
+fn pack_free_head(tag: u64, slab_idx: usize) -> u64 {
+    debug_assert!(tag <= FREE_TAG_MASK);
+    debug_assert!(slab_idx <= NO_FREE_SLAB);
+    (tag << FREE_INDEX_BITS) | slab_idx as u64
+}
+
+#[inline(always)]
+fn unpack_free_head(value: u64) -> (u64, usize) {
+    (value >> FREE_INDEX_BITS, (value & FREE_INDEX_MASK) as usize)
+}
 
 #[repr(C, align(64))]
 pub struct Slab {
@@ -46,7 +63,7 @@ impl Default for SlabState {
         Self {
             reader_mask: AtomicU64::new(0),
             next_slab_idx: AtomicUsize::new(NO_SUCCESSOR),
-            next_free: AtomicUsize::new(NO_SUCCESSOR),
+            next_free: AtomicUsize::new(NO_FREE_SLAB),
         }
     }
 }
@@ -93,9 +110,10 @@ pub struct Core {
     pub(crate) states: Vec<SlabState>,
     pub(crate) pool_cap: usize,
     pub(crate) reader_capacity: usize,
-    pub(crate) write_cursor: WriteCursor,
-    /// Head of the intrusive free-slab stack. `NO_SUCCESSOR` means empty.
-    free_head: AtomicUsize,
+    pub(crate) write_cursors: Box<[WriteCursor]>,
+    /// ABA-tagged head of the preallocated slab stack shared by writer lanes.
+    free_head: AtomicU64,
+    writers_claimed: AtomicBool,
     #[cfg(feature = "telemetry")]
     pub writer_metrics: Arc<TelemetryShard>,
     #[cfg(feature = "telemetry")]
@@ -108,6 +126,7 @@ unsafe impl Send for Core {}
 /// A single-producer write session. One release publish covers every record appended to it.
 pub struct CoreWriter<'a> {
     core: &'a Core,
+    cursor: &'a WriteCursor,
     idx: usize,
     offset: usize,
     current_slab: *mut Slab,
@@ -119,11 +138,27 @@ pub struct CoreWriter<'a> {
     bytes_processed: usize,
 }
 
+/// An exclusive producer for one arena lane. It owns its current slab and never shares a
+/// write cursor with another producer.
+pub struct WriterLane {
+    core: Arc<Core>,
+    lane: usize,
+    idx: usize,
+    offset: usize,
+}
+
 pub struct ReaderHandle {
     core: Arc<Core>,
     client_id: usize,
+    lane: usize,
     current_slab_idx: Cell<usize>,
     current_offset: Cell<usize>,
+}
+
+/// Broadcast reader over every writer lane. Records retain lane-local order.
+pub struct ReaderSet {
+    readers: Vec<ReaderHandle>,
+    next_lane: Cell<usize>,
 }
 
 /// Streams `len` bytes from `src` to `dst`, using non-temporal (write-combining) stores
@@ -172,10 +207,24 @@ fn sfence() {
 
 impl Core {
     pub fn new(cap: usize, max_readers: usize) -> Self {
+        Self::new_with_lanes(cap, max_readers, 1)
+    }
+
+    /// Creates one shared preallocated slab pool with `lanes` exclusive writers.
+    pub fn new_with_lanes(cap: usize, max_readers: usize, lanes: usize) -> Self {
         assert!(cap >= 2, "arena requires at least two slabs");
+        assert!(lanes > 0, "arena requires at least one writer lane");
+        assert!(
+            cap > lanes,
+            "arena requires one free slab beyond its writer lanes"
+        );
         assert!(
             cap <= MAX_CURSOR_SLAB_INDEX,
             "arena capacity exceeds packed cursor range"
+        );
+        assert!(
+            cap <= NO_FREE_SLAB,
+            "arena capacity exceeds shared free-stack range"
         );
         let layout = std::alloc::Layout::array::<Slab>(cap).unwrap();
         let slabs_base = unsafe { std::alloc::alloc_zeroed(layout) as *mut Slab };
@@ -186,14 +235,11 @@ impl Core {
         for _ in 0..cap {
             states.push(SlabState::default());
         }
-
-        if cap > 1 {
-            for i in 1..cap {
-                let next = if i + 1 < cap { i + 1 } else { NO_SUCCESSOR };
-                states[i].next_free.store(next, Ordering::Relaxed);
-            }
+        for idx in lanes..cap {
+            let next = if idx + 1 < cap { idx + 1 } else { NO_FREE_SLAB };
+            states[idx].next_free.store(next, Ordering::Relaxed);
         }
-        let free_head = AtomicUsize::new(if cap > 1 { 1 } else { NO_SUCCESSOR });
+        let free_head = AtomicU64::new(pack_free_head(0, lanes));
 
         #[cfg(feature = "telemetry")]
         let mut reader_metrics = Vec::with_capacity(max_readers);
@@ -206,8 +252,9 @@ impl Core {
             states,
             pool_cap: cap,
             reader_capacity: max_readers,
-            write_cursor: WriteCursor::new(0, 0),
+            write_cursors: (0..lanes).map(|lane| WriteCursor::new(lane, 0)).collect(),
             free_head,
+            writers_claimed: AtomicBool::new(false),
             #[cfg(feature = "telemetry")]
             writer_metrics: Arc::new(TelemetryShard::default()),
             #[cfg(feature = "telemetry")]
@@ -218,33 +265,37 @@ impl Core {
     fn push_free(&self, idx: usize) {
         loop {
             let head = self.free_head.load(Ordering::Acquire);
-            self.states[idx].next_free.store(head, Ordering::Relaxed);
-            if self
-                .free_head
-                .compare_exchange_weak(head, idx, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    /// Pops a slab index off the free stack, or `None` if it's currently empty. Only the
-    /// writer calls this (single consumer), but it still needs a CAS because pushers
-    /// (readers, or the writer's own self-reclaim) can race with it concurrently.
-    fn pop_free(&self) -> Option<usize> {
-        loop {
-            let head = self.free_head.load(Ordering::Acquire);
-            if head == NO_SUCCESSOR {
-                return None;
-            }
-            let next = self.states[head].next_free.load(Ordering::Acquire);
+            let (tag, head_idx) = unpack_free_head(head);
+            self.states[idx]
+                .next_free
+                .store(head_idx, Ordering::Relaxed);
+            let next = pack_free_head((tag.wrapping_add(1)) & FREE_TAG_MASK, idx);
             if self
                 .free_head
                 .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(head);
+                return;
+            }
+        }
+    }
+
+    /// Pops a slab index off the shared preallocated pool.
+    fn pop_free(&self) -> Option<usize> {
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            let (tag, idx) = unpack_free_head(head);
+            if idx == NO_FREE_SLAB {
+                return None;
+            }
+            let next_idx = self.states[idx].next_free.load(Ordering::Acquire);
+            let next = pack_free_head((tag.wrapping_add(1)) & FREE_TAG_MASK, next_idx);
+            if self
+                .free_head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(idx);
             }
         }
     }
@@ -283,7 +334,6 @@ impl Core {
         self.states[current_idx]
             .next_slab_idx
             .store(next_idx, Ordering::Release);
-        self.write_cursor.store(next_idx, 0, Ordering::Release);
 
         if reader_mask == 0 {
             self.push_free(current_idx);
@@ -296,9 +346,15 @@ impl Core {
     /// cursor is published once after the closure returns.
     #[inline(always)]
     pub unsafe fn append_batch(&self, write: impl FnOnce(&mut CoreWriter<'_>)) {
-        let (idx, offset) = self.write_cursor.load(Ordering::Relaxed);
+        assert_eq!(
+            self.write_cursors.len(),
+            1,
+            "multi-lane cores require an exclusive WriterLane"
+        );
+        let (idx, offset) = self.write_cursors[0].load(Ordering::Relaxed);
         let mut writer = CoreWriter {
             core: self,
+            cursor: &self.write_cursors[0],
             idx,
             offset,
             current_slab: unsafe { self.slabs_base.add(idx) },
@@ -317,6 +373,27 @@ impl Core {
     #[inline(always)]
     pub unsafe fn append_bytes(&self, bytes: &[u8]) {
         unsafe { self.append_batch(|writer| writer.append(bytes)) };
+    }
+
+    /// Claims every writer lane exactly once. Move each returned lane to its ingress thread.
+    pub fn writer_lanes(self: &Arc<Self>) -> Vec<WriterLane> {
+        assert!(
+            !self.writers_claimed.swap(true, Ordering::AcqRel),
+            "writer lanes can only be claimed once"
+        );
+        self.write_cursors
+            .iter()
+            .enumerate()
+            .map(|(lane, cursor)| {
+                let (idx, offset) = cursor.load(Ordering::Relaxed);
+                WriterLane {
+                    core: Arc::clone(self),
+                    lane,
+                    idx,
+                    offset,
+                }
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -387,11 +464,9 @@ impl CoreWriter<'_> {
     }
 
     #[inline(always)]
-    unsafe fn finish(self) {
+    unsafe fn finish(self) -> (usize, usize) {
         sfence();
-        self.core
-            .write_cursor
-            .store(self.idx, self.offset, Ordering::Release);
+        self.cursor.store(self.idx, self.offset, Ordering::Release);
 
         #[cfg(feature = "telemetry")]
         {
@@ -409,6 +484,37 @@ impl CoreWriter<'_> {
                 .total_duration
                 .fetch_add(duration, Ordering::Relaxed);
         }
+
+        (self.idx, self.offset)
+    }
+}
+
+impl WriterLane {
+    /// Appends a batch without sharing a cursor or active slab with another writer.
+    #[inline(always)]
+    pub fn append_batch(&mut self, write: impl FnOnce(&mut CoreWriter<'_>)) {
+        let mut writer = CoreWriter {
+            core: &self.core,
+            cursor: &self.core.write_cursors[self.lane],
+            idx: self.idx,
+            offset: self.offset,
+            current_slab: unsafe { self.core.slabs_base.add(self.idx) },
+            #[cfg(feature = "telemetry")]
+            start_mark: Instant::now(),
+            #[cfg(feature = "telemetry")]
+            ops_count: 0,
+            #[cfg(feature = "telemetry")]
+            bytes_processed: 0,
+        };
+        write(&mut writer);
+        let (idx, offset) = unsafe { writer.finish() };
+        self.idx = idx;
+        self.offset = offset;
+    }
+
+    #[inline(always)]
+    pub fn append_bytes(&mut self, bytes: &[u8]) {
+        self.append_batch(|writer| writer.append(bytes));
     }
 }
 
@@ -424,18 +530,27 @@ impl ReaderHandle {
     /// `client_id` must be unique and within `0..max_readers`. Create every reader before the
     /// producer starts and keep each handle alive until that producer has stopped.
     pub unsafe fn new(core: Arc<Core>, client_id: usize) -> Self {
+        unsafe { Self::new_for_lane(core, client_id, 0) }
+    }
+
+    unsafe fn new_for_lane(core: Arc<Core>, client_id: usize, lane: usize) -> Self {
         assert!(client_id < 64, "reader IDs must fit in the reader mask");
         assert!(
             client_id < core.reader_capacity,
             "reader ID exceeds configured reader capacity"
         );
+        assert!(
+            lane < core.write_cursors.len(),
+            "reader lane does not exist"
+        );
         let reader = Self {
             core,
             client_id,
-            current_slab_idx: Cell::new(0),
+            lane,
+            current_slab_idx: Cell::new(lane),
             current_offset: Cell::new(0),
         };
-        reader.core.states[0]
+        reader.core.states[lane]
             .reader_mask
             .fetch_or(1u64 << client_id, Ordering::Relaxed);
         reader
@@ -472,20 +587,19 @@ impl ReaderHandle {
         next_idx
     }
 
-    /// Multi-Reader Fast Path: Consumes streams with hardware-friendly busy spinning.
+    /// Reads one record if this lane has published one, without spinning.
     #[inline(always)]
-    pub fn read_next_blocking(&self, out_buf: &mut [u8]) -> usize {
+    pub fn try_read_next(&self, out_buf: &mut [u8]) -> Option<usize> {
         let core = &self.core;
         let mut idx = self.current_slab_idx.get();
         let mut offset = self.current_offset.get();
         #[cfg(feature = "telemetry")]
         let start_mark = Instant::now();
-        let mut spin_count = 0;
 
         unsafe {
             let slab_ptr = loop {
                 let (global_write_idx, global_write_offset) =
-                    core.write_cursor.load(Ordering::Acquire);
+                    core.write_cursors[self.lane].load(Ordering::Acquire);
 
                 if idx != global_write_idx || offset < global_write_offset {
                     let slab_ptr = core.slabs_base.add(idx);
@@ -496,18 +610,7 @@ impl ReaderHandle {
                     offset = 0;
                     continue;
                 }
-
-                // Exponential compiler backoff mechanism to protect memory bus lanes
-                if spin_count < 10 {
-                    std::hint::spin_loop();
-                } else if spin_count < 20 {
-                    for _ in 0..10 {
-                        std::hint::spin_loop();
-                    }
-                } else {
-                    std::thread::yield_now();
-                }
-                spin_count += 1;
+                return None;
             };
 
             let src = (*slab_ptr).data.as_ptr().add(offset);
@@ -539,7 +642,77 @@ impl ReaderHandle {
                 shard.total_duration.fetch_add(duration, Ordering::Relaxed);
             }
 
-            to_read
+            Some(to_read)
+        }
+    }
+
+    /// Multi-reader fast path with hardware-friendly busy spinning.
+    #[inline(always)]
+    pub fn read_next_blocking(&self, out_buf: &mut [u8]) -> usize {
+        let mut spin_count = 0;
+        loop {
+            if let Some(read) = self.try_read_next(out_buf) {
+                return read;
+            }
+            if spin_count < 10 {
+                std::hint::spin_loop();
+            } else if spin_count < 20 {
+                for _ in 0..10 {
+                    std::hint::spin_loop();
+                }
+            } else {
+                std::thread::yield_now();
+            }
+            spin_count += 1;
+        }
+    }
+}
+
+impl ReaderSet {
+    /// # Safety
+    /// `client_id` must be unique and within `0..max_readers`. Create every reader before the
+    /// producers start and keep each handle alive until those producers have stopped.
+    pub unsafe fn new(core: Arc<Core>, client_id: usize) -> Self {
+        let readers = (0..core.write_cursors.len())
+            .map(|lane| unsafe { ReaderHandle::new_for_lane(Arc::clone(&core), client_id, lane) })
+            .collect();
+        Self {
+            readers,
+            next_lane: Cell::new(0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn try_read_next(&self, out_buf: &mut [u8]) -> Option<usize> {
+        let lanes = self.readers.len();
+        let start = self.next_lane.get();
+        for offset in 0..lanes {
+            let lane = (start + offset) % lanes;
+            if let Some(read) = self.readers[lane].try_read_next(out_buf) {
+                self.next_lane.set((lane + 1) % lanes);
+                return Some(read);
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub fn read_next_blocking(&self, out_buf: &mut [u8]) -> usize {
+        let mut spin_count = 0;
+        loop {
+            if let Some(read) = self.try_read_next(out_buf) {
+                return read;
+            }
+            if spin_count < 10 {
+                std::hint::spin_loop();
+            } else if spin_count < 20 {
+                for _ in 0..10 {
+                    std::hint::spin_loop();
+                }
+            } else {
+                std::thread::yield_now();
+            }
+            spin_count += 1;
         }
     }
 }
