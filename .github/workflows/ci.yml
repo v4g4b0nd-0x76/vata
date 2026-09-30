@@ -17,17 +17,31 @@ jobs:
         include:
           - name: udp_listener
             features: udp_listener
+            needs_bpf_linker: false
           - name: udp_listener + telemetry
             features: udp_listener telemetry
+            needs_bpf_linker: false
           - name: xdp
             features: xdp
+            needs_bpf_linker: true
           - name: xdp + telemetry
             features: xdp telemetry
+            needs_bpf_linker: true
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+      - name: Install bpf-linker
+        if: matrix.needs_bpf_linker
+        run: |
+          curl --fail --location --retry 3 \
+            --output /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          mkdir -p "$HOME/.local/bin"
+          tar --zstd --extract --file /tmp/bpf-linker.tar.zst --directory "$HOME/.local/bin"
+          "$HOME/.local/bin/bpf-linker" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: cargo test -p vata --features "${{ matrix.features }}"
       - run: cargo build -p vata --release --features "${{ matrix.features }}"
