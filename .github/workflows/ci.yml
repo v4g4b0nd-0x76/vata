@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: udp_listener
+            features: udp_listener
+          - name: udp_listener + telemetry
+            features: udp_listener telemetry
+          - name: xdp
+            features: xdp
+          - name: xdp + telemetry
+            features: xdp telemetry
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: cargo test -p vata --features "${{ matrix.features }}"
+      - run: cargo build -p vata --release --features "${{ matrix.features }}"
