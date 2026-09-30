@@ -40,6 +40,28 @@ async fn main() -> Result<(), VataErr> {
         )));
     }
     #[cfg(feature = "udp_listener")]
+    if !udp_listener_conf.cpu_cores.is_empty()
+        && udp_listener_conf.cpu_cores.len() != udp_listener_conf.receiver
+    {
+        return Err(VataErr::ConfLoadFailed(String::from(
+            "udp listener cpu_cores must contain one CPU per receiver",
+        )));
+    }
+    if let Some(cpu) = conf.core_conf.numa_cpu {
+        vata::cpu_tuning::validate_cpu(cpu)
+            .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
+    }
+    #[cfg(feature = "udp_listener")]
+    for &cpu in &udp_listener_conf.cpu_cores {
+        vata::cpu_tuning::validate_cpu(cpu)
+            .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
+    }
+    #[cfg(feature = "xdp")]
+    if let Some(cpu) = conf.xdp_conf.as_ref().and_then(|config| config.cpu) {
+        vata::cpu_tuning::validate_cpu(cpu)
+            .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
+    }
+    #[cfg(feature = "udp_listener")]
     let lanes = udp_listener_conf.receiver;
     #[cfg(not(feature = "udp_listener"))]
     let lanes = 1;
@@ -48,6 +70,10 @@ async fn main() -> Result<(), VataErr> {
         return Err(VataErr::ConfLoadFailed(String::from(
             "core capacity needs one free slab beyond every writer lane",
         )));
+    }
+    if let Some(cpu) = conf.core_conf.numa_cpu {
+        vata::cpu_tuning::pin_current_thread(cpu)
+            .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
     }
     let arena = Arc::new(Core::new_with_lanes(
         slab_count,
@@ -74,12 +100,16 @@ async fn main() -> Result<(), VataErr> {
     {
         use vata::{UDP_RECV_BATCH, udp_listener::spawn_receivers};
 
-        let blocking_handles =
-            spawn_receivers(udp_listener_conf.port, UDP_RECV_BATCH, arena.writer_lanes())
-                .map_err(|err| VataErr::SpwanUdpReceiver(err.to_string()))?;
+        let blocking_handles = spawn_receivers(
+            udp_listener_conf.port,
+            UDP_RECV_BATCH,
+            arena.writer_lanes(),
+            udp_listener_conf.cpu_cores.clone(),
+        )
+        .map_err(|err| VataErr::SpwanUdpReceiver(err.to_string()))?;
         eprintln!(
-            "UDP listener started on port {}; graceful Ctrl-C/SIGINT handling is not installed yet",
-            udp_listener_conf.port
+            "UDP listener started on port {} CPUs {:?}; graceful Ctrl-C/SIGINT handling is not installed yet",
+            udp_listener_conf.port, udp_listener_conf.cpu_cores
         );
         for handle in blocking_handles {
             handle.join().expect("worker thread panicked");
@@ -87,6 +117,10 @@ async fn main() -> Result<(), VataErr> {
     }
     #[cfg(feature = "xdp")]
     {
+        if let Some(cpu) = conf.xdp_conf.as_ref().and_then(|config| config.cpu) {
+            vata::cpu_tuning::pin_current_thread(cpu)
+                .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
+        }
         let mut xdp = match conf.xdp_conf.as_ref() {
             Some(config) => Some(vata::xdp::start(config)?),
             None => None,
@@ -94,7 +128,7 @@ async fn main() -> Result<(), VataErr> {
 
         if let Some(xdp) = xdp.as_mut() {
             eprintln!(
-                "XDP listener started on {}:{}; graceful Ctrl-C/SIGINT handling is not installed yet",
+                "XDP listener started on {}:{} CPU {:?}; graceful Ctrl-C/SIGINT handling is not installed yet",
                 conf.xdp_conf
                     .as_ref()
                     .expect("started XDP has configuration")
@@ -102,7 +136,11 @@ async fn main() -> Result<(), VataErr> {
                 conf.xdp_conf
                     .as_ref()
                     .expect("started XDP has configuration")
-                    .udp_port
+                    .udp_port,
+                conf.xdp_conf
+                    .as_ref()
+                    .expect("started XDP has configuration")
+                    .cpu
             );
             xdp.run(&arena)?;
         }

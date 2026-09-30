@@ -14,6 +14,8 @@ pub struct UdpListener {
     pub port: u16,
     pub processor: usize,
     pub receiver: usize,
+    #[serde(default)]
+    pub cpu_cores: Vec<usize>,
 }
 #[derive(Deserialize, Default)]
 pub struct TelemetryConf {
@@ -23,11 +25,13 @@ pub struct TelemetryConf {
 pub struct CoreConf {
     pub max_readers: usize,
     pub cap: usize, // user provide gb of pre-alloc we convert to number of slabs
+    pub numa_cpu: Option<usize>,
 }
 #[derive(Deserialize)]
 pub struct XdpConf {
     pub interface: String,
     pub udp_port: u16,
+    pub cpu: Option<usize>,
 }
 
 impl Conf {
@@ -82,5 +86,36 @@ mod tests {
         .unwrap();
 
         assert!(conf.xdp_conf.is_none());
+    }
+
+    #[test]
+    fn ingress_cpu_tuning_accepts_pinned_receivers_and_first_touch_cpu() {
+        let conf: Conf = toml::from_str(
+            r#"
+            [core_conf]
+            max_readers = 2
+            cap = 2
+            numa_cpu = 2
+
+            [telemetry_conf]
+            report_interval_ms = 1000
+
+            [udp_listener]
+            port = 9000
+            processor = 2
+            receiver = 2
+            cpu_cores = [4, 6]
+
+            [xdp_conf]
+            interface = "eth0"
+            udp_port = 5353
+            cpu = 4
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(conf.core_conf.numa_cpu, Some(2));
+        assert_eq!(conf.udp_listener.unwrap().cpu_cores, [4, 6]);
+        assert_eq!(conf.xdp_conf.unwrap().cpu, Some(4));
     }
 }

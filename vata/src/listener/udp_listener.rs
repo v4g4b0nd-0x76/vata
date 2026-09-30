@@ -22,14 +22,22 @@ pub fn spawn_receivers(
     port: u16,
     recv_batch: usize,
     writers: Vec<WriterLane>,
+    cpu_cores: Vec<usize>,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::with_capacity(writers.len());
     for (thread_idx, writer) in writers.into_iter().enumerate() {
         let socket = new_socket(port)?;
+        let cpu = cpu_cores.get(thread_idx).copied();
         handles.push(
             thread::Builder::new()
                 .name(format!("udp-recv-{thread_idx}"))
-                .spawn(move || receiver_loop(socket, recv_batch, writer))?,
+                .spawn(move || {
+                    if let Some(cpu) = cpu {
+                        crate::cpu_tuning::pin_current_thread(cpu)
+                            .expect("validated UDP CPU must remain available");
+                    }
+                    receiver_loop(socket, recv_batch, writer)
+                })?,
         );
     }
     Ok(handles)

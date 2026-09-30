@@ -153,6 +153,7 @@ mod tests {
         let result = start(&XdpConf {
             interface: "eth0".to_owned(),
             udp_port: 5353,
+            cpu: None,
         });
         let Err(error) = result else {
             panic!("a binary without the xdp feature must reject xdp configuration");
