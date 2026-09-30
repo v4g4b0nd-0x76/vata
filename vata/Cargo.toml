@@ -44,5 +44,10 @@ harness = false
 name = "udp_workload"
 harness = false
 
+[[bin]]
+name = "xdp_probe"
+path = "src/bin/xdp_probe.rs"
+required-features = ["xdp"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

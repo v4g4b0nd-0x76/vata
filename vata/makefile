@@ -7,8 +7,12 @@ ifeq ($(shell uname -s),Linux)
 MALLOC_CONF := MALLOC_CONF="abort_conf:true,thp:always,metadata_thp:always"
 endif
 BENCH_NAME  := arena_bench
+XDP_IFACE ?=
+XDP_PORT ?=
+XDP_PACKETS ?= 100000
+XDP_TIMEOUT_SECS ?= 30
 
-.PHONY: all build bench workload udp-workload profile-perf flamegraph clean
+.PHONY: all build bench workload udp-workload xdp-probe profile-perf flamegraph clean
 
 all: build
 
@@ -24,6 +28,12 @@ workload:
 
 udp-workload:
 	$(RUSTFLAGS) $(MALLOC_CONF) $(CARGO) bench --bench udp_workload
+
+xdp-probe:
+	@test -n "$(XDP_IFACE)" || (echo "set XDP_IFACE, for example enp4s0"; exit 2)
+	@test -n "$(XDP_PORT)" || (echo "set XDP_PORT, for example 9000"; exit 2)
+	$(RUSTFLAGS) $(CARGO) build --release --features xdp --bin xdp_probe
+	sudo "$$($(CARGO) metadata --no-deps --format-version 1 | jq -r '.target_directory')/release/xdp_probe" $(XDP_IFACE) $(XDP_PORT) $(XDP_PACKETS) $(XDP_TIMEOUT_SECS)
 
 ## 1. Call raw perf to analyze IPC, cache-misses, and branch mispredictions
 profile-perf:
