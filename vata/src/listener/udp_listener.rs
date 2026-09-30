@@ -112,7 +112,11 @@ fn append_received(
 unsafe fn recvmmsg_batch(fd: i32, msgs: *mut mmsghdr, batch: u32, nonblocking: bool) -> i32 {
     #[cfg(not(all(target_env = "musl", target_os = "linux")))]
     {
-        let flags = if nonblocking { libc::MSG_DONTWAIT } else { 0 };
+        let flags = if nonblocking {
+            libc::MSG_DONTWAIT
+        } else {
+            libc::MSG_WAITFORONE
+        };
         unsafe { libc::recvmmsg(fd, msgs, batch, flags, std::ptr::null_mut()) }
     }
 }

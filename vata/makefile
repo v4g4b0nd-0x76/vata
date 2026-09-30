@@ -8,7 +8,7 @@ MALLOC_CONF := MALLOC_CONF="abort_conf:true,thp:always,metadata_thp:always"
 endif
 BENCH_NAME  := arena_bench
 
-.PHONY: all build bench workload profile-perf flamegraph clean
+.PHONY: all build bench workload udp-workload profile-perf flamegraph clean
 
 all: build
 
@@ -21,6 +21,9 @@ bench:
 
 workload:
 	$(RUSTFLAGS) $(MALLOC_CONF) $(CARGO) bench --bench arena_workload
+
+udp-workload:
+	$(RUSTFLAGS) $(MALLOC_CONF) $(CARGO) bench --bench udp_workload
 
 ## 1. Call raw perf to analyze IPC, cache-misses, and branch mispredictions
 profile-perf:

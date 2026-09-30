@@ -40,5 +40,9 @@ harness = false
 name = "arena_workload"
 harness = false
 
+[[bench]]
+name = "udp_workload"
+harness = false
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
