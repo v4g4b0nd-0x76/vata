@@ -1,5 +1,9 @@
 # Vata
 
+> **Name.** *Vāta* is an Avestan wind name. In ancient Iranian / Zoroastrian
+> tradition, Vāta and Vāyu are connected with wind and atmosphere. That is
+> where Vata gets its name. [Encyclopaedia Iranica](https://www.iranicaonline.org/articles/vayu/)
+
 Vata is an in-memory, preallocated record arena for fast local ingestion and
 fan-out to readers. It is not a durable queue: a restart loses data, and slow
 readers eventually hold up slab reuse.
