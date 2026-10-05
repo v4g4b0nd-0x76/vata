@@ -7,7 +7,8 @@ edition = "2024"
 telemetry = []
 xdp = ["dep:aya", "dep:xdp"]
 non_temporal_writes = []
-udp_listener = []
+ingress = []
+udp_listener = ["ingress"]
 
 [dependencies]
 libc = "0.2.189"
@@ -42,6 +43,10 @@ harness = false
 
 [[bench]]
 name = "udp_workload"
+harness = false
+
+[[bench]]
+name = "client_workload"
 harness = false
 
 [[bin]]

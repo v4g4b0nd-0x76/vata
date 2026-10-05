@@ -7,10 +7,13 @@ pub struct Conf {
     pub core_conf: CoreConf,
     pub telemetry_conf: TelemetryConf,
     pub xdp_conf: Option<XdpConf>,
-    pub udp_listener: Option<UdpListener>,
+    #[serde(alias = "udp_listener")]
+    pub ingress: Option<IngressConf>,
+    #[serde(alias = "client_listener")]
+    pub client: Option<ClientConf>,
 }
 #[derive(Deserialize, Default)]
-pub struct UdpListener {
+pub struct IngressConf {
     pub port: u16,
     pub processor: usize,
     pub receiver: usize,
@@ -32,6 +35,16 @@ pub struct XdpConf {
     pub interface: String,
     pub udp_port: u16,
     pub cpu: Option<usize>,
+}
+#[derive(Deserialize)]
+pub struct ClientConf {
+    pub addr: String,
+    #[serde(default = "default_client_queue_capacity")]
+    pub queue_capacity: usize,
+}
+
+fn default_client_queue_capacity() -> usize {
+    1024
 }
 
 impl Conf {
@@ -100,7 +113,7 @@ mod tests {
             [telemetry_conf]
             report_interval_ms = 1000
 
-            [udp_listener]
+            [ingress]
             port = 9000
             processor = 2
             receiver = 2
@@ -115,7 +128,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(conf.core_conf.numa_cpu, Some(2));
-        assert_eq!(conf.udp_listener.unwrap().cpu_cores, [4, 6]);
+        assert_eq!(conf.ingress.unwrap().cpu_cores, [4, 6]);
         assert_eq!(conf.xdp_conf.unwrap().cpu, Some(4));
+    }
+
+    #[test]
+    fn client_accepts_address_and_queue_capacity() {
+        let conf: Conf = toml::from_str(
+            r#"
+            [core_conf]
+            max_readers = 1
+            cap = 2
+
+            [telemetry_conf]
+            report_interval_ms = 1000
+
+            [client]
+            addr = "127.0.0.1:9100"
+            queue_capacity = 32
+            "#,
+        )
+        .unwrap();
+
+        let client = conf.client.expect("client is configured");
+        assert_eq!(client.addr, "127.0.0.1:9100");
+        assert_eq!(client.queue_capacity, 32);
     }
 }

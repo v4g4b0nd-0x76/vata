@@ -49,7 +49,7 @@ pub fn spawn_receivers(
         let cpu = cpu_cores.get(thread_idx).copied();
         handles.push(
             thread::Builder::new()
-                .name(format!("udp-recv-{thread_idx}"))
+                .name(format!("ingress-recv-{thread_idx}"))
                 .spawn(move || {
                     if let Some(cpu) = cpu {
                         crate::cpu_tuning::pin_current_thread(cpu)

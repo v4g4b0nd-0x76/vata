@@ -1,4 +1,5 @@
-pub mod udp_listener;
+pub mod client;
+pub mod ingress;
 
 pub const UDP_SOCKET_BUF_SIZE: usize = 64 * 1024 * 1024;
 pub const UDP_IO_BATCH_TARGET_BYTES: usize = 256 * 1024;
@@ -16,4 +17,6 @@ pub const UDP_RECV_BATCH_TARGET_BYTES: usize = 512 * 1024;
 
 pub const UDP_RECV_BATCH: usize = UDP_RECV_BATCH_TARGET_BYTES / MAX_UDP_DATAGRAM;
 #[cfg(test)]
-mod udp_test;
+mod client_test;
+#[cfg(test)]
+mod ingress_test;

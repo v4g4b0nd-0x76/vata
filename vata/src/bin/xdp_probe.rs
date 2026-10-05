@@ -1,4 +1,4 @@
-use std::{env, process, time::Duration};
+use std::{env, process, sync::Arc, time::Duration};
 
 use vata::{
     XdpConf,
@@ -67,9 +67,14 @@ fn main() {
     println!("udp_port={udp_port}");
     println!("expected_packets={packet_limit}");
 
-    let core = Core::new(2, 0);
+    let core = Arc::new(Core::new_with_lanes(2, 0, 1));
+    let mut writer = core.writer_lanes().pop().unwrap();
     let stats = ingress
-        .run_for(&core, packet_limit, Duration::from_secs(timeout_seconds))
+        .run_for(
+            &mut writer,
+            packet_limit,
+            Duration::from_secs(timeout_seconds),
+        )
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             process::exit(1);

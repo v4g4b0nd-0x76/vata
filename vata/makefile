@@ -12,7 +12,7 @@ XDP_PORT ?=
 XDP_PACKETS ?= 100000
 XDP_TIMEOUT_SECS ?= 30
 
-.PHONY: all build bench workload udp-workload xdp-probe profile-perf flamegraph clean
+.PHONY: all build bench workload udp-workload client-workload xdp-probe profile-perf flamegraph clean
 
 all: build
 
@@ -28,6 +28,9 @@ workload:
 
 udp-workload:
 	$(RUSTFLAGS) $(MALLOC_CONF) $(CARGO) bench --bench udp_workload
+
+client-workload:
+	$(RUSTFLAGS) $(MALLOC_CONF) $(CARGO) bench --bench client_workload
 
 xdp-probe:
 	@test -n "$(XDP_IFACE)" || (echo "set XDP_IFACE, for example enp4s0"; exit 2)

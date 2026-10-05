@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::arena_alloc::{Core, ReaderSet};
-use crate::listener::udp_listener::spawn_receivers;
+use crate::listener::ingress::spawn_receivers;
 
 #[test]
 fn loopback_datagram_reaches_an_arena_writer_lane() {
@@ -31,7 +31,7 @@ fn loopback_datagram_reaches_an_arena_writer_lane() {
         }
         assert!(
             Instant::now() < deadline,
-            "UDP listener did not publish the datagram"
+            "UDP ingress did not publish the datagram"
         );
         std::thread::yield_now();
     }

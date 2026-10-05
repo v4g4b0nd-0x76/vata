@@ -12,7 +12,8 @@ pub use listener::*;
 pub enum VataErr {
     ConfLoadFailed(String),
     XdpUnavailable(String),
-    SpwanUdpReceiver(String),
+    Ingress(String),
+    Client(String),
     CpuTuningFailed(String),
 }
 impl Display for VataErr {
@@ -20,7 +21,8 @@ impl Display for VataErr {
         match self {
             VataErr::ConfLoadFailed(err) => writeln!(f, "failed to load config: {}", err),
             VataErr::XdpUnavailable(err) => writeln!(f, "XDP is unavailable: {}", err),
-            VataErr::SpwanUdpReceiver(err) => writeln!(f, "failed to spawn udp listener: {}", err),
+            VataErr::Ingress(err) => writeln!(f, "failed to start ingress: {}", err),
+            VataErr::Client(err) => writeln!(f, "failed to start client endpoint: {}", err),
             VataErr::CpuTuningFailed(err) => writeln!(f, "CPU tuning failed: {}", err),
         }
     }

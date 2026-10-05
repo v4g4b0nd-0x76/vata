@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vata::arena_alloc::{Core, ReaderSet};
-use vata::udp_listener::spawn_receivers;
+use vata::ingress::spawn_receivers;
 
 const DEFAULT_PACKETS: usize = 100_000;
 const PAYLOAD_BYTES: usize = 1024;
@@ -44,7 +44,7 @@ fn main() {
         }
         assert!(
             Instant::now() < warmup_deadline,
-            "UDP listener did not receive the warmup datagram"
+            "UDP ingress did not receive the warmup datagram"
         );
         thread::yield_now();
     }

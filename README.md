@@ -13,19 +13,26 @@ cursor update; every reader sees every record. That makes it useful when
 several local consumers need the same data, not when consumers should divide
 work between themselves.
 
-## Pick one ingress path
+## Communication types
 
-Run **one** ingress path per Vata process. The current startup sequence enters
-the UDP listener first, so configuring both paths does not run them together.
+Vata has three communication paths. The TCP client endpoint can run beside one
+packet ingress path. Use either normal UDP ingress or XDP/AF_XDP ingress for
+packets; do not configure both as the active packet path in one process.
 
-### UDP listener
+| Path | Direction | Use when | Avoid when |
+| --- | --- | --- | --- |
+| UDP ingress | outside -> arena | You need simple fire-and-forget datagram ingestion. | You need ACKs, retries, or client libraries. |
+| TCP client | client <-> arena | CLIs and libraries need read, write, or read_write over one connection. | You need NIC-bypass packet capture. |
+| XDP / AF_XDP ingress | NIC UDP packets -> arena | Kernel UDP receive overhead is measured as the bottleneck on Linux. | You need normal TCP connections or portability. |
+
+### Ingress
 
 Use this as the default path. It uses normal Linux UDP sockets and `recvmmsg`:
 each receiver owns a writer lane and appends its receive batch directly to the
 arena.
 
 ```toml
-[udp_listener]
+[ingress]
 port = 9000
 receiver = 1
 processor = 1 # must match receiver; the receiver owns the writer lane
@@ -42,7 +49,30 @@ the arena. Batching reduces syscall and cursor-publication overhead; it does
 not make UDP reliable or durable. Kernel receive-buffer pressure and a slow
 reader can still cause loss or backpressure.
 
-### XDP / AF_XDP listener
+### Client
+
+Enable this when a CLI or library needs to read and/or write over TCP:
+
+```toml
+[client]
+addr = "127.0.0.1:9100"
+queue_capacity = 1024
+```
+
+The first frame chooses the connection mode: `1 = read`, `2 = write`,
+`3 = read_write`; its body is `mode:u8` plus `batch_size:u16be`. Vata replies
+with `ACK`. A read or read_write connection receives `DELIVERY` frames forever.
+A write or read_write connection sends `PUSH_BATCH` frames on the same socket.
+Batch bodies are `record_count:u16be` followed by `record_len:u32be + bytes`
+for each record, so `batch_size = 2` sends two arena records per delivery. The
+stream is live and non-durable: reconnecting warms a new connection, not a
+replay cursor. UDP ingress can run beside TCP; TCP gets its own writer lane.
+
+Use client mode for controlled producers, read-side libraries, retries, and
+connection warming. Use read_write mode when a client wants one socket for both
+`PUSH_BATCH` and `DELIVERY`.
+
+### XDP / AF_XDP Ingress
 
 Use this only on Linux, after the UDP path is measured as the bottleneck and
 the target NIC has been shown to support it. The XDP program passes all traffic
@@ -74,6 +104,10 @@ while the probe runs.
 XDP has stricter operational requirements: Linux capabilities, eBPF/AF_XDP
 support, a compatible NIC driver, and queue-aware deployment. This implementation
 has one AF_XDP socket on queue 0; it is not a multi-queue scale-out path yet.
+It intentionally does not implement TCP connections over AF_XDP. AF_XDP gives
+Vata raw TCP segments, not an established TCP stream; making that behave like
+the client endpoint would mean owning handshake, ACKs, retransmits, ordering,
+congestion, and teardown. Use the TCP client endpoint for TCP connections.
 
 On the current test host, the strict probe on `enp4s0` failed before XDP was
 attached:
@@ -95,14 +129,16 @@ different CPU, NIC, packet size, or reader count.
 | --- | ---: | --- |
 | Direct arena, 100k records of 1 KiB | `append_bytes`: 9.829 ms; `append_batch(64)`: 5.841 ms write, 2.911 ms read | Publishing the cursor once per batch helps this synthetic in-memory path. |
 | `make -C vata workload`, 2M records of 1 KiB, four readers | 9.965 ms median per 100k-record write batch; zero steady-state allocations | The workload moves about 512 MB through writer and reader copies per reported batch. It measures memory/cache work, not a network link. |
-| `make -C vata udp-workload`, loopback, 100k UDP packets of 1 KiB | 100k received, no loss, about 563k packets/s or 0.576 GB/s payload | This covers `recvmmsg` → arena writer → reader on localhost. It is not NIC throughput. |
+| `make -C vata udp-workload`, loopback, 100k UDP packets of 1 KiB | 100k received, no loss, about 563k packets/s or 0.576 GB/s payload | This covers `recvmmsg` -> arena writer -> reader on localhost. It is not NIC throughput. |
+| `make -C vata client-workload`, loopback TCP, 100k records of 1 KiB | run locally for your host | This covers TCP frame write/read on one client socket plus arena fan-out. |
 | Strict AF_XDP zero-copy probe on `enp4s0` | `EOPNOTSUPP` at bind | Zero-copy was unavailable, so no AF_XDP NIC throughput was measured. |
 
-Run the two repeatable local checks with:
+Run the repeatable local checks with:
 
 ```sh
 make -C vata workload
 make -C vata udp-workload
+make -C vata client-workload
 ```
 
 For a real network result, use a separate sender on the target NIC, record link
@@ -111,7 +147,7 @@ Compare only runs with the same setup.
 
 ## Practical guidance
 
-Start with the UDP listener and the end-to-end workload. Move to XDP only when
+Start with normal ingress and the end-to-end workload. Move to XDP only when
 the measurements show UDP receive overhead matters and the deployment has a
 supported NIC. If higher throughput is still needed, scale by RX queue with one
 writer lane per queue; adding writers to one shared queue is not the next win.

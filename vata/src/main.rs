@@ -21,38 +21,40 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), VataErr> {
     let conf = Arc::new(Conf::load()?);
-    #[cfg(feature = "udp_listener")]
-    let udp_listener_conf = conf
-        .udp_listener
+    #[cfg(feature = "ingress")]
+    let ingress_conf = conf
+        .ingress
         .as_ref()
-        .ok_or_else(|| VataErr::ConfLoadFailed(String::from("udp listener conf not provided")))?;
-    #[cfg(feature = "udp_listener")]
-    if udp_listener_conf.receiver == 0 {
+        .ok_or_else(|| VataErr::ConfLoadFailed(String::from("ingress conf not provided")))?;
+    #[cfg(feature = "ingress")]
+    if ingress_conf.receiver == 0 {
         return Err(VataErr::ConfLoadFailed(String::from(
-            "udp listener requires at least one receiver",
+            "ingress requires at least one receiver",
         )));
     }
-    #[cfg(feature = "udp_listener")]
-    if udp_listener_conf.processor != 0 && udp_listener_conf.processor != udp_listener_conf.receiver
-    {
+    #[cfg(feature = "ingress")]
+    if ingress_conf.processor != 0 && ingress_conf.processor != ingress_conf.receiver {
         return Err(VataErr::ConfLoadFailed(String::from(
-            "udp listener processors must match receivers; receivers now own writer lanes",
+            "ingress processors must match receivers; receivers now own writer lanes",
         )));
     }
-    #[cfg(feature = "udp_listener")]
-    if !udp_listener_conf.cpu_cores.is_empty()
-        && udp_listener_conf.cpu_cores.len() != udp_listener_conf.receiver
-    {
+    #[cfg(feature = "ingress")]
+    if !ingress_conf.cpu_cores.is_empty() && ingress_conf.cpu_cores.len() != ingress_conf.receiver {
         return Err(VataErr::ConfLoadFailed(String::from(
-            "udp listener cpu_cores must contain one CPU per receiver",
+            "ingress cpu_cores must contain one CPU per receiver",
         )));
     }
     if let Some(cpu) = conf.core_conf.numa_cpu {
         vata::cpu_tuning::validate_cpu(cpu)
             .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
     }
-    #[cfg(feature = "udp_listener")]
-    for &cpu in &udp_listener_conf.cpu_cores {
+    if conf.client.is_some() && conf.core_conf.max_readers == 0 {
+        return Err(VataErr::ConfLoadFailed(String::from(
+            "client endpoint requires core_conf.max_readers >= 1",
+        )));
+    }
+    #[cfg(feature = "ingress")]
+    for &cpu in &ingress_conf.cpu_cores {
         vata::cpu_tuning::validate_cpu(cpu)
             .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
     }
@@ -61,10 +63,15 @@ async fn main() -> Result<(), VataErr> {
         vata::cpu_tuning::validate_cpu(cpu)
             .map_err(|err| VataErr::CpuTuningFailed(err.to_string()))?;
     }
-    #[cfg(feature = "udp_listener")]
-    let lanes = udp_listener_conf.receiver;
-    #[cfg(not(feature = "udp_listener"))]
-    let lanes = 1;
+    let tcp_writer_lanes = usize::from(conf.client.is_some());
+    #[cfg(feature = "xdp")]
+    let xdp_writer_lanes = usize::from(conf.xdp_conf.is_some());
+    #[cfg(not(feature = "xdp"))]
+    let xdp_writer_lanes = 0usize;
+    #[cfg(feature = "ingress")]
+    let lanes = ingress_conf.receiver + tcp_writer_lanes + xdp_writer_lanes;
+    #[cfg(not(feature = "ingress"))]
+    let lanes = (tcp_writer_lanes + xdp_writer_lanes).max(1);
     let slab_count = slabs_for_gib(conf.core_conf.cap)?;
     if slab_count <= lanes {
         return Err(VataErr::ConfLoadFailed(String::from(
@@ -80,8 +87,47 @@ async fn main() -> Result<(), VataErr> {
         conf.core_conf.max_readers,
         lanes,
     ));
-    #[cfg(not(any(feature = "telemetry", feature = "udp_listener", feature = "xdp")))]
+    #[cfg(not(any(feature = "telemetry", feature = "ingress", feature = "xdp")))]
     let _ = &arena;
+
+    #[cfg(feature = "ingress")]
+    let mut writer_lanes = arena.writer_lanes();
+    #[cfg(not(feature = "ingress"))]
+    let mut writer_lanes: Vec<vata::arena_alloc::WriterLane> = if conf.client.is_some() {
+        arena.writer_lanes()
+    } else {
+        Vec::new()
+    };
+    let client_writer = if conf.client.is_some() {
+        writer_lanes.pop()
+    } else {
+        None
+    };
+    #[cfg(feature = "xdp")]
+    let mut xdp_writer = if conf.xdp_conf.is_some() {
+        writer_lanes.pop()
+    } else {
+        None
+    };
+
+    let _client = if let Some(config) = conf.client.as_ref() {
+        let addr = config
+            .addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|err| VataErr::ConfLoadFailed(format!("client.addr is invalid: {err}")))?;
+        Some(
+            vata::client::spawn(
+                addr,
+                Arc::clone(&arena),
+                client_writer,
+                0,
+                config.queue_capacity,
+            )
+            .map_err(|err| VataErr::Client(err.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     #[cfg(feature = "telemetry")]
     let telemetry_opts = ReportTelemetryOpts {
@@ -96,20 +142,20 @@ async fn main() -> Result<(), VataErr> {
         report_telemetry(telemetry_opts).await;
     });
 
-    #[cfg(feature = "udp_listener")]
+    #[cfg(feature = "ingress")]
     {
-        use vata::{UDP_RECV_BATCH, udp_listener::spawn_receivers};
+        use vata::{UDP_RECV_BATCH, ingress::spawn_receivers};
 
         let blocking_handles = spawn_receivers(
-            udp_listener_conf.port,
+            ingress_conf.port,
             UDP_RECV_BATCH,
-            arena.writer_lanes(),
-            udp_listener_conf.cpu_cores.clone(),
+            writer_lanes,
+            ingress_conf.cpu_cores.clone(),
         )
-        .map_err(|err| VataErr::SpwanUdpReceiver(err.to_string()))?;
+        .map_err(|err| VataErr::Ingress(err.to_string()))?;
         eprintln!(
-            "UDP listener started on port {} CPUs {:?}; graceful Ctrl-C/SIGINT handling is not installed yet",
-            udp_listener_conf.port, udp_listener_conf.cpu_cores
+            "Ingress started on UDP port {} CPUs {:?}; graceful Ctrl-C/SIGINT handling is not installed yet",
+            ingress_conf.port, ingress_conf.cpu_cores
         );
         for handle in blocking_handles {
             handle.join().expect("worker thread panicked");
@@ -142,7 +188,10 @@ async fn main() -> Result<(), VataErr> {
                     .expect("started XDP has configuration")
                     .cpu
             );
-            xdp.run(&arena)?;
+            let writer = xdp_writer
+                .as_mut()
+                .expect("configured XDP must reserve a writer lane");
+            xdp.run(writer)?;
         }
     }
     Ok(())

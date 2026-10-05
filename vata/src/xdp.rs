@@ -1,4 +1,4 @@
-use crate::{VataErr, XdpConf, arena_alloc::Core};
+use crate::{VataErr, XdpConf, arena_alloc::WriterLane};
 
 #[derive(Debug)]
 pub struct XdpProbeStats {
@@ -129,7 +129,7 @@ mod linux {
     }
 
     impl XdpIngress {
-        pub fn run(&mut self, core: &Core) -> Result<(), VataErr> {
+        pub fn run(&mut self, writer: &mut WriterLane) -> Result<(), VataErr> {
             let mut packets = StackSlab::<BATCH_SIZE>::new();
 
             loop {
@@ -141,14 +141,14 @@ mod linux {
                     continue;
                 }
 
-                self.drain_ready(core, &mut packets)?;
+                self.drain_ready(writer, &mut packets)?;
             }
         }
 
         /// Runs the same AF_XDP-to-arena path for a bounded hardware probe.
         pub fn run_for(
             &mut self,
-            core: &Core,
+            writer: &mut WriterLane,
             packet_limit: usize,
             timeout: Duration,
         ) -> Result<XdpProbeStats, VataErr> {
@@ -180,7 +180,7 @@ mod linux {
                 {
                     continue;
                 }
-                let (received, payload_bytes) = self.drain_ready(core, &mut packets)?;
+                let (received, payload_bytes) = self.drain_ready(writer, &mut packets)?;
                 stats.packets += received;
                 stats.payload_bytes += payload_bytes;
             }
@@ -197,7 +197,7 @@ mod linux {
         #[inline(always)]
         fn drain_ready(
             &mut self,
-            core: &Core,
+            writer: &mut WriterLane,
             packets: &mut StackSlab<BATCH_SIZE>,
         ) -> Result<(usize, usize), VataErr> {
             let rx = self
@@ -207,15 +207,13 @@ mod linux {
                 .ok_or_else(|| failed("AF_XDP receive ring is disabled"))?;
             let received = unsafe { rx.recv(&self.umem, packets) };
             let mut payload_bytes = 0;
-            unsafe {
-                core.append_batch(|writer| {
-                    while let Some(packet) = packets.pop_back() {
-                        payload_bytes += packet.len();
-                        writer.append(&packet);
-                        self.umem.free_packet(packet);
-                    }
-                });
-            }
+            writer.append_batch(|out| {
+                while let Some(packet) = packets.pop_back() {
+                    payload_bytes += packet.len();
+                    out.append(&packet);
+                    self.umem.free_packet(packet);
+                }
+            });
 
             if received != 0
                 && unsafe { self.rings.fill_ring.enqueue(&mut self.umem, received) } != received
@@ -251,7 +249,7 @@ pub fn start_zerocopy(_: &XdpConf) -> Result<XdpIngress, VataErr> {
 
 #[cfg(not(all(feature = "xdp", target_os = "linux")))]
 impl XdpIngress {
-    pub fn run(&mut self, _: &Core) -> Result<(), VataErr> {
+    pub fn run(&mut self, _: &mut WriterLane) -> Result<(), VataErr> {
         Err(VataErr::XdpUnavailable(
             "rebuild on Linux with --features xdp".to_owned(),
         ))
@@ -259,7 +257,7 @@ impl XdpIngress {
 
     pub fn run_for(
         &mut self,
-        _: &Core,
+        _: &mut WriterLane,
         _: usize,
         _: std::time::Duration,
     ) -> Result<XdpProbeStats, VataErr> {
