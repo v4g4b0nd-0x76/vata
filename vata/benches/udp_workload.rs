@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
@@ -21,20 +22,16 @@ fn packets() -> usize {
         .unwrap_or(DEFAULT_PACKETS)
 }
 
-fn main() {
+fn run() -> io::Result<()> {
     let packets = packets();
-    let port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    let port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?
+        .local_addr()?
         .port();
     let core = Arc::new(Core::new_with_lanes(8, 1, 1));
     let reader = unsafe { ReaderSet::new(Arc::clone(&core), 0) };
-    let _receivers = spawn_receivers(port, 64, core.writer_lanes(), Vec::new()).unwrap();
-    let warmup_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    warmup_sender
-        .send_to(b"warmup", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-        .unwrap();
+    let _receivers = spawn_receivers(port, 64, core.writer_lanes(), Vec::new())?;
+    let warmup_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    warmup_sender.send_to(b"warmup", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))?;
     let warmup_deadline = Instant::now() + RECEIVE_TIMEOUT;
     let mut warmup_out = [0; 16];
     loop {
@@ -51,18 +48,16 @@ fn main() {
     let ready = Arc::new(Barrier::new(2));
     let sender_ready = Arc::clone(&ready);
     let (sent_tx, sent_rx) = mpsc::channel();
-    let sender = thread::spawn(move || {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        socket
-            .connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-            .unwrap();
+    let sender = thread::spawn(move || -> io::Result<usize> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        socket.connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))?;
         let payload = [b'B'; PAYLOAD_BYTES];
         sender_ready.wait();
         let sent = (0..packets)
             .filter(|_| socket.send(&payload).is_ok())
             .count();
         sent_tx.send(()).unwrap();
-        sent
+        Ok(sent)
     });
 
     ready.wait();
@@ -93,7 +88,7 @@ fn main() {
             thread::yield_now();
         }
     }
-    let sent = sender.join().unwrap();
+    let sent = sender.join().unwrap()?;
     let dropped = sent.saturating_sub(received);
     let elapsed = last_received.duration_since(started);
 
@@ -107,5 +102,16 @@ fn main() {
     );
     if dropped > 0 {
         eprintln!("UDP loss observed; reduce VATA_UDP_PACKETS for a loss-free comparison");
+    }
+    Ok(())
+}
+
+fn main() {
+    match run() {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipping udp_workload: localhost UDP unavailable: {err}");
+        }
+        Err(err) => panic!("udp_workload failed: {err}"),
     }
 }
