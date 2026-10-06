@@ -166,6 +166,11 @@ make -C vata udp-workload
 make -C vata client-workload
 ```
 
+GitHub Releases are built by `.github/workflows/release.yml`. Push a `v*` tag
+to publish Linux and macOS tarballs containing `vata`, `vata-cli`, and this
+README. Manual workflow dispatch builds the same artifacts without publishing a
+release.
+
 For a real network result, use a separate sender on the target NIC, record link
 speed, packet size, sender rate, CPU pinning, packet loss, and the exact commit.
 Compare only runs with the same setup.

@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            archive: vata-linux-x86_64.tar.gz
+          - name: macos
+            os: macos-latest
+            archive: vata-macos.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --locked --release -p vata -p vata-cli --features vata/ingress
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.name }}"
+          cp target/release/vata "dist/${{ matrix.name }}/"
+          cp target/release/vata-cli "dist/${{ matrix.name }}/"
+          cp README.md "dist/${{ matrix.name }}/"
+          tar -C dist -czf "${{ matrix.archive }}" "${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.archive }}
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*"
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Vata $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz --clobber
