@@ -72,6 +72,31 @@ Use client mode for controlled producers, read-side libraries, retries, and
 connection warming. Use read_write mode when a client wants one socket for both
 `PUSH_BATCH` and `DELIVERY`.
 
+### CLI
+
+`vata-cli` is a small redis-cli-style client. It keeps named targets in
+`~/.vata-cli.toml` by default, or in `VATA_CLI_STATE` when that environment
+variable is set. Run it without arguments for a REPL, or pass one command and
+exit:
+
+```sh
+cargo run -p vata-cli -- help
+cargo run -p vata-cli -- add local 127.0.0.1 9100 8030
+cargo run -p vata-cli -- load-config conf.toml local
+cargo run -p vata-cli -- select local
+cargo run -p vata-cli -- write 'hello vata'
+cargo run -p vata-cli -- read 1000
+cargo run -p vata-cli -- bulk ./records.bin 1024
+cargo run -p vata-cli -- udp 'raw datagram'
+cargo run -p vata-cli -- udp-bulk ./packets.bin 1024
+```
+
+Inside the REPL, use `servers`, `current`, `connect`, `ping`, `write`, `read`,
+`bulk`, `udp`, `udp-bulk`, `help`, and `exit`. `load-config` imports `[client]`
+as the TCP endpoint and `[ingress]` or `[xdp_conf]` as the UDP target. TCP bulk
+and UDP bulk split files into chunks no larger than Vata's current record size
+limit.
+
 ### XDP / AF_XDP Ingress
 
 Use this only on Linux, after the UDP path is measured as the bottleneck and

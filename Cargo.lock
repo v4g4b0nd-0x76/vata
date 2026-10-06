@@ -920,6 +920,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vata-cli"
+version = "0.1.0"
+dependencies = [
+ "toml",
+ "vata",
+]
+
+[[package]]
 name = "vata-ebpf"
 version = "0.1.0"
 dependencies = [
